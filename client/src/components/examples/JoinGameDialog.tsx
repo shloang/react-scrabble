@@ -6,7 +6,7 @@ export default function JoinGameDialogExample() {
       <JoinGameDialog
         open={true}
         playerCount={1}
-        onJoin={(name) => console.log('Player joined:', name)}
+        onJoin={(name, password) => console.log('Player joined:', name, password)}
       />
     </div>
   );

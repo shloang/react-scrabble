@@ -47,12 +47,24 @@ export interface PlacedTile {
   letter: string;
 }
 
+export interface Move {
+  playerId: string;
+  playerName: string;
+  words: string[];
+  score: number;
+  turn: number;
+  timestamp: number;
+  type?: 'play' | 'skip' | 'exchange';
+  meta?: Record<string, any> | null;
+}
+
 export interface GameState {
   board: (string | null)[][];
   tileBag: string[];
   players: Player[];
   currentPlayer: string | null;
   turn: number;
+  moves?: Move[];
 }
 
 export const playerSchema = z.object({
@@ -68,6 +80,16 @@ export const gameStateSchema = z.object({
   players: z.array(playerSchema),
   currentPlayer: z.string().nullable(),
   turn: z.number(),
+  moves: z.array(z.object({
+    playerId: z.string(),
+    playerName: z.string(),
+    words: z.array(z.string()),
+    score: z.number(),
+    turn: z.number(),
+    timestamp: z.number(),
+    type: z.enum(['play', 'skip', 'exchange']).optional(),
+    meta: z.record(z.any()).nullable().optional()
+  })).optional(),
 });
 
 export type InsertPlayer = Omit<Player, 'id'>;

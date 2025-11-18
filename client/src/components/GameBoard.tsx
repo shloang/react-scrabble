@@ -5,6 +5,8 @@ interface GameBoardProps {
   board: (string | null)[][];
   placedTiles: PlacedTile[];
   onSquareClick?: (row: number, col: number) => void;
+  onTileDrop?: (row: number, col: number, data: any) => void;
+  placedWordStatuses?: { word: string; positions: { row: number; col: number }[]; status: 'valid' | 'invalid' | 'checking' }[];
 }
 
 function getSquareType(row: number, col: number): SquareType {
@@ -16,7 +18,7 @@ function getSquareType(row: number, col: number): SquareType {
   return 'NORMAL';
 }
 
-export default function GameBoard({ board, placedTiles, onSquareClick }: GameBoardProps) {
+export default function GameBoard({ board, placedTiles, onSquareClick, onTileDrop, placedWordStatuses }: GameBoardProps) {
   return (
     <div className="w-full max-w-[800px] mx-auto" data-testid="game-board">
       <div 
@@ -33,6 +35,17 @@ export default function GameBoard({ board, placedTiles, onSquareClick }: GameBoa
               t => t.row === rowIndex && t.col === colIndex
             );
             
+            // Determine highlight status for this square based on placedWordStatuses
+            let highlight: 'valid' | 'invalid' | 'checking' | null = null;
+            if (placedWordStatuses) {
+              for (const w of placedWordStatuses) {
+                if (w.positions.some(p => p.row === rowIndex && p.col === colIndex)) {
+                  highlight = w.status;
+                  break;
+                }
+              }
+            }
+
             return (
               <BoardSquare
                 key={`${rowIndex}-${colIndex}`}
@@ -42,6 +55,8 @@ export default function GameBoard({ board, placedTiles, onSquareClick }: GameBoa
                 letter={cell}
                 isNewlyPlaced={isNewlyPlaced}
                 onClick={() => onSquareClick?.(rowIndex, colIndex)}
+                onDrop={(r, c, data) => onTileDrop?.(r, c, data)}
+                highlight={highlight}
               />
             );
           })

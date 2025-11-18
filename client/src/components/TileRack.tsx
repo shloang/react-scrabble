@@ -5,6 +5,7 @@ import { Shuffle, RotateCcw } from "lucide-react";
 interface TileRackProps {
   rack: (string | null)[];
   selectedTileIndex: number | null;
+  selectedIndices?: number[];
   onTileClick: (index: number) => void;
   onShuffle: () => void;
   onRecall: () => void;
@@ -14,6 +15,7 @@ interface TileRackProps {
 export default function TileRack({ 
   rack, 
   selectedTileIndex, 
+  selectedIndices,
   onTileClick, 
   onShuffle, 
   onRecall,
@@ -27,8 +29,43 @@ export default function TileRack({
             <Tile
               letter={letter}
               isEmpty={letter === null}
-              isSelected={selectedTileIndex === index}
+              isSelected={
+                (selectedIndices && selectedIndices.includes(index)) || selectedTileIndex === index
+              }
               onClick={() => canInteract && letter && onTileClick(index)}
+              onDragStart={(e) => {
+                if (!canInteract || !letter) return;
+                try {
+                  // Set payload
+                  e.dataTransfer.setData('text/plain', JSON.stringify({ source: 'rack', index }));
+                  e.dataTransfer.effectAllowed = 'move';
+
+                  // Add dragging body class for cursor
+                  document.body.classList.add('dragging');
+
+                  // Create ghost element for nicer drag image
+                  const ghost = document.createElement('div');
+                  ghost.className = 'drag-ghost';
+                  ghost.textContent = letter;
+                  document.body.appendChild(ghost);
+                  // Use half width/height offset
+                  const rect = ghost.getBoundingClientRect();
+                  const offsetX = rect.width / 2;
+                  const offsetY = rect.height / 2;
+                  try {
+                    e.dataTransfer.setDragImage(ghost, offsetX, offsetY);
+                  } catch (err) {
+                    // ignore if not supported
+                  }
+                  // Remove after a tick — drag image is already captured by browser
+                  setTimeout(() => ghost.remove(), 0);
+                } catch (err) {
+                  // ignore
+                }
+              }}
+              onDragEnd={() => {
+                document.body.classList.remove('dragging');
+              }}
             />
           </div>
         ))}

@@ -19,11 +19,11 @@ export async function initializeGame(): Promise<GameState> {
   return response.json();
 }
 
-export async function joinGame(playerName: string): Promise<{ playerId: string; gameState: GameState }> {
+export async function joinGame(playerName: string, password: string): Promise<{ playerId: string; gameState: GameState }> {
   const response = await fetch('/api/game/join', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ playerName })
+    body: JSON.stringify({ playerName, password })
   });
   if (!response.ok) {
     const error = await response.json();

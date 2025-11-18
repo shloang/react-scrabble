@@ -35,7 +35,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         tileBag: bag,
         players: [],
         currentPlayer: null,
-        turn: 0
+        turn: 0,
+        moves: []
       };
 
       await storage.saveGameState(newGameState);
@@ -48,10 +49,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Join game
   app.post("/api/game/join", async (req, res) => {
     try {
-      const { playerName } = req.body;
-      
+      const { playerName, password } = req.body;
+
       if (!playerName || typeof playerName !== 'string' || !playerName.trim()) {
         return res.status(400).json({ error: "Player name is required" });
+      }
+
+      if (!password || typeof password !== 'string' || !password.trim()) {
+        return res.status(400).json({ error: "Password is required" });
       }
 
       let gameState = await storage.getGameState();
@@ -75,10 +80,27 @@ export async function registerRoutes(app: Express): Promise<Server> {
           tileBag: bag,
           players: [],
           currentPlayer: null,
-          turn: 0
+          turn: 0,
+          moves: []
         };
       }
 
+      // Check for existing player by name (case-insensitive)
+      const normalized = playerName.trim().toLowerCase();
+      const existing = gameState.players.find(p => p.name.trim().toLowerCase() === normalized);
+
+      if (existing) {
+        // Verify password
+        const ok = await storage.verifyPlayerPassword(existing.id, password);
+        if (!ok) {
+          return res.status(403).json({ error: 'Name already taken with different password' });
+        }
+
+        // Good: return existing player id and current game state
+        return res.json({ playerId: existing.id, gameState });
+      }
+
+      // Create new player
       if (gameState.players.length >= 3) {
         return res.status(400).json({ error: "Game is full (max 3 players)" });
       }
@@ -95,7 +117,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
       };
 
       gameState.players.push(newPlayer);
-      
+
+      // Save password for new player
+      await storage.setPlayerPassword(playerId, password);
+
       // Set first player as current player
       if (gameState.players.length === 1) {
         gameState.currentPlayer = playerId;

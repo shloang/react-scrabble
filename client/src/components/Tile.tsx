@@ -6,9 +6,12 @@ interface TileProps {
   isEmpty?: boolean;
   onClick?: () => void;
   className?: string;
+  draggable?: boolean;
+  onDragStart?: (e: any) => void;
+  onDragEnd?: (e: any) => void;
 }
 
-export default function Tile({ letter, isSelected, isEmpty, onClick, className = '' }: TileProps) {
+export default function Tile({ letter, isSelected, isEmpty, onClick, className = '', draggable, onDragStart, onDragEnd }: TileProps) {
   if (isEmpty) {
     return (
       <div 
@@ -32,6 +35,9 @@ export default function Tile({ letter, isSelected, isEmpty, onClick, className =
   return (
     <div
       onClick={onClick}
+      draggable={!!onDragStart}
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
       className={`
         w-full aspect-square bg-amber-100 dark:bg-amber-900 rounded-md shadow-md relative
         flex items-center justify-center font-bold text-2xl
