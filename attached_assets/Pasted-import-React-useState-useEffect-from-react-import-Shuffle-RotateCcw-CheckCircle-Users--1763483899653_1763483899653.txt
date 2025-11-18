@@ -1,0 +1,649 @@
+import React, { useState, useEffect } from 'react';
+import { Shuffle, RotateCcw, CheckCircle, Users, Clock, AlertCircle } from 'lucide-react';
+
+const BOARD_SIZE = 15;
+const TILE_VALUES = {
+  А: 1, Б: 3, В: 1, Г: 3, Д: 2, Е: 1, Ё: 3, Ж: 5, З: 5, И: 1, Й: 4, К: 2, Л: 2,
+  М: 2, Н: 1, О: 1, П: 2, Р: 1, С: 1, Т: 1, У: 2, Ф: 10, Х: 5, Ц: 5, Ч: 5,
+  Ш: 8, Щ: 10, Ъ: 10, Ы: 4, Ь: 3, Э: 8, Ю: 8, Я: 3, '?': 0
+};
+
+const TILE_DISTRIBUTION = {
+  А: 10, Б: 3, В: 5, Г: 3, Д: 5, Е: 9, Ё: 1, Ж: 2, З: 2, И: 10, Й: 2, К: 6, Л: 4,
+  М: 5, Н: 8, О: 10, П: 6, Р: 6, С: 6, Т: 5, У: 3, Ф: 1, Х: 2, Ц: 1, Ч: 2,
+  Ш: 1, Щ: 1, Ъ: 1, Ы: 3, Ь: 3, Э: 1, Ю: 1, Я: 3, '?': 2
+};
+
+const SPECIAL_SQUARES = {
+  TW: [[0,0], [0,7], [0,14], [7,0], [7,14], [14,0], [14,7], [14,14]],
+  DW: [[1,1], [2,2], [3,3], [4,4], [1,13], [2,12], [3,11], [4,10], [10,4], [11,3], [12,2], [13,1], [10,10], [11,11], [12,12], [13,13]],
+  TL: [[1,5], [1,9], [5,1], [5,5], [5,9], [5,13], [9,1], [9,5], [9,9], [9,13], [13,5], [13,9]],
+  DL: [[0,3], [0,11], [2,6], [2,8], [3,0], [3,7], [3,14], [6,2], [6,6], [6,8], [6,12], [7,3], [7,11], [8,2], [8,6], [8,8], [8,12], [11,0], [11,7], [11,14], [12,6], [12,8], [14,3], [14,11]]
+};
+
+const MOVE_TIME = 120;
+const PLAYER_COLORS = ['bg-blue-100', 'bg-green-100', 'bg-purple-100'];
+
+const ScrabbleGame = () => {
+  const [gameState, setGameState] = useState(null);
+  const [playerId, setPlayerId] = useState(null);
+  const [playerName, setPlayerName] = useState('');
+  const [isJoining, setIsJoining] = useState(true);
+  const [selectedTile, setSelectedTile] = useState(null);
+  const [placedTiles, setPlacedTiles] = useState([]);
+  const [timeLeft, setTimeLeft] = useState(MOVE_TIME);
+  const [isValidating, setIsValidating] = useState(false);
+  const [validationMessage, setValidationMessage] = useState('');
+
+  useEffect(() => {
+    loadGameState();
+    const interval = setInterval(loadGameState, 2000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    if (!gameState || !playerId) return;
+    
+    if (gameState.currentPlayer === playerId) {
+      const timer = setInterval(() => {
+        setTimeLeft(prev => {
+          if (prev <= 1) {
+            skipTurn();
+            return MOVE_TIME;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+      return () => clearInterval(timer);
+    } else {
+      setTimeLeft(MOVE_TIME);
+    }
+  }, [gameState?.currentPlayer, playerId]);
+
+  const loadGameState = async () => {
+    try {
+      const result = await window.storage.get('scrabble-game', true);
+      if (result) {
+        setGameState(JSON.parse(result.value));
+      }
+    } catch (error) {
+      console.log('No existing game');
+    }
+  };
+
+  const saveGameState = async (state) => {
+    await window.storage.set('scrabble-game', JSON.stringify(state), true);
+    setGameState(state);
+  };
+
+  const initializeGame = async () => {
+    const bag = [];
+    Object.entries(TILE_DISTRIBUTION).forEach(([letter, count]) => {
+      for (let i = 0; i < count; i++) {
+        bag.push(letter);
+      }
+    });
+    shuffleArray(bag);
+
+    const newGameState = {
+      board: Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(null)),
+      tileBag: bag,
+      players: [],
+      currentPlayer: null,
+      turn: 0
+    };
+
+    await saveGameState(newGameState);
+    setIsJoining(true);
+  };
+
+  const joinGame = async () => {
+    if (!playerName.trim()) return;
+    
+    let state = gameState;
+    if (!state) {
+      await initializeGame();
+      state = JSON.parse((await window.storage.get('scrabble-game', true)).value);
+    }
+
+    if (state.players.length >= 3) {
+      alert('Игра уже заполнена (максимум 3 игрока)');
+      return;
+    }
+
+    const newPlayerId = `player_${Date.now()}_${Math.random()}`;
+    const rack = state.tileBag.splice(0, 7);
+
+    const newPlayer = {
+      id: newPlayerId,
+      name: playerName,
+      rack: rack,
+      score: 0
+    };
+
+    state.players.push(newPlayer);
+    if (state.players.length === 1) {
+      state.currentPlayer = newPlayerId;
+    }
+
+    await saveGameState(state);
+    setPlayerId(newPlayerId);
+    setIsJoining(false);
+    setTimeLeft(MOVE_TIME);
+  };
+
+  const shuffleArray = (array) => {
+    for (let i = array.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [array[i], array[j]] = [array[j], array[i]];
+    }
+  };
+
+  const getSquareType = (row, col) => {
+    if (row === 7 && col === 7) return 'START';
+    for (const [type, positions] of Object.entries(SPECIAL_SQUARES)) {
+      if (positions.some(([r, c]) => r === row && c === col)) return type;
+    }
+    return 'NORMAL';
+  };
+
+  const getSquareColor = (type) => {
+    switch(type) {
+      case 'TW': return 'bg-red-500';
+      case 'DW': return 'bg-pink-400';
+      case 'TL': return 'bg-blue-500';
+      case 'DL': return 'bg-sky-400';
+      case 'START': return 'bg-pink-400';
+      default: return 'bg-green-100';
+    }
+  };
+
+  const getCurrentPlayer = () => {
+    return gameState?.players.find(p => p.id === playerId);
+  };
+
+  const handleSquareClick = (row, col) => {
+    if (gameState.currentPlayer !== playerId) return;
+    
+    const currentPlayer = getCurrentPlayer();
+    if (!currentPlayer) return;
+
+    if (selectedTile !== null && gameState.board[row][col] === null) {
+      const newState = { ...gameState };
+      newState.board[row][col] = currentPlayer.rack[selectedTile];
+      currentPlayer.rack[selectedTile] = null;
+      
+      setPlacedTiles([...placedTiles, { row, col, letter: gameState.board[row][col] || currentPlayer.rack[selectedTile] }]);
+      setSelectedTile(null);
+      saveGameState(newState);
+    } else if (gameState.board[row][col] !== null && placedTiles.some(t => t.row === row && t.col === col)) {
+      const tile = placedTiles.find(t => t.row === row && t.col === col);
+      const newState = { ...gameState };
+      newState.board[row][col] = null;
+      
+      const emptyIndex = currentPlayer.rack.findIndex(t => t === null);
+      currentPlayer.rack[emptyIndex] = tile.letter;
+      
+      setPlacedTiles(placedTiles.filter(t => !(t.row === row && t.col === col)));
+      saveGameState(newState);
+    }
+  };
+
+  const handleTileClick = (index) => {
+    if (gameState.currentPlayer !== playerId) return;
+    const currentPlayer = getCurrentPlayer();
+    if (currentPlayer && currentPlayer.rack[index] !== null) {
+      setSelectedTile(selectedTile === index ? null : index);
+    }
+  };
+
+  const shuffleRack = () => {
+    if (gameState.currentPlayer !== playerId) return;
+    const currentPlayer = getCurrentPlayer();
+    const nonNullTiles = currentPlayer.rack.filter(t => t !== null);
+    shuffleArray(nonNullTiles);
+    const newRack = [...currentPlayer.rack];
+    let idx = 0;
+    for (let i = 0; i < newRack.length; i++) {
+      if (newRack[i] !== null) {
+        newRack[i] = nonNullTiles[idx++];
+      }
+    }
+    currentPlayer.rack = newRack;
+    saveGameState(gameState);
+  };
+
+  const extractWordsFromBoard = () => {
+    const words = [];
+    
+    // Check horizontal words
+    for (let row = 0; row < BOARD_SIZE; row++) {
+      let word = '';
+      let startCol = -1;
+      let positions = [];
+      
+      for (let col = 0; col < BOARD_SIZE; col++) {
+        if (gameState.board[row][col]) {
+          if (word === '') startCol = col;
+          word += gameState.board[row][col];
+          positions.push({ row, col });
+        } else {
+          if (word.length > 1) {
+            const hasNewTile = positions.some(pos => 
+              placedTiles.some(t => t.row === pos.row && t.col === pos.col)
+            );
+            if (hasNewTile) {
+              words.push({ word, positions });
+            }
+          }
+          word = '';
+          positions = [];
+        }
+      }
+      if (word.length > 1) {
+        const hasNewTile = positions.some(pos => 
+          placedTiles.some(t => t.row === pos.row && t.col === pos.col)
+        );
+        if (hasNewTile) {
+          words.push({ word, positions });
+        }
+      }
+    }
+    
+    // Check vertical words
+    for (let col = 0; col < BOARD_SIZE; col++) {
+      let word = '';
+      let startRow = -1;
+      let positions = [];
+      
+      for (let row = 0; row < BOARD_SIZE; row++) {
+        if (gameState.board[row][col]) {
+          if (word === '') startRow = row;
+          word += gameState.board[row][col];
+          positions.push({ row, col });
+        } else {
+          if (word.length > 1) {
+            const hasNewTile = positions.some(pos => 
+              placedTiles.some(t => t.row === pos.row && t.col === pos.col)
+            );
+            if (hasNewTile) {
+              words.push({ word, positions });
+            }
+          }
+          word = '';
+          positions = [];
+        }
+      }
+      if (word.length > 1) {
+        const hasNewTile = positions.some(pos => 
+          placedTiles.some(t => t.row === pos.row && t.col === pos.col)
+        );
+        if (hasNewTile) {
+          words.push({ word, positions });
+        }
+      }
+    }
+    
+    // If only one tile placed, it's the word itself
+    if (words.length === 0 && placedTiles.length === 1) {
+      words.push({ 
+        word: placedTiles[0].letter, 
+        positions: [{ row: placedTiles[0].row, col: placedTiles[0].col }] 
+      });
+    }
+    
+    return words;
+  };
+
+  const validateWordInWiktionary = async (word) => {
+    try {
+      const url = `https://ru.wiktionary.org/w/api.php?action=query&titles=${encodeURIComponent(word)}&format=json&origin=*`;
+      const response = await fetch(url);
+      const data = await response.json();
+      
+      const pages = data.query.pages;
+      const pageId = Object.keys(pages)[0];
+      
+      // If pageId is -1, the page doesn't exist
+      if (pageId === '-1') {
+        return false;
+      }
+      
+      // Page exists
+      return true;
+    } catch (error) {
+      console.error('Error validating word:', error);
+      return false;
+    }
+  };
+
+  const submitMove = async () => {
+    if (gameState.currentPlayer !== playerId || placedTiles.length === 0) return;
+
+    setIsValidating(true);
+    setValidationMessage('Проверка слов...');
+
+    // Extract all words formed
+    const words = extractWordsFromBoard();
+    
+    if (words.length === 0) {
+      setValidationMessage('Не найдено слов!');
+      setIsValidating(false);
+      return;
+    }
+
+    // Validate all words
+    const validationResults = await Promise.all(
+      words.map(async ({ word }) => ({
+        word,
+        valid: await validateWordInWiktionary(word.toLowerCase())
+      }))
+    );
+
+    const invalidWords = validationResults.filter(r => !r.valid);
+
+    if (invalidWords.length > 0) {
+      setValidationMessage(`Недопустимые слова: ${invalidWords.map(w => w.word).join(', ')}`);
+      setIsValidating(false);
+      
+      // Return tiles to rack
+      setTimeout(() => {
+        const currentPlayer = getCurrentPlayer();
+        placedTiles.forEach(({ row, col, letter }) => {
+          gameState.board[row][col] = null;
+          const emptyIndex = currentPlayer.rack.findIndex(t => t === null);
+          currentPlayer.rack[emptyIndex] = letter;
+        });
+        setPlacedTiles([]);
+        setSelectedTile(null);
+        saveGameState(gameState);
+        setValidationMessage('');
+      }, 3000);
+      
+      return;
+    }
+
+    setValidationMessage(`Валидные слова: ${validationResults.map(r => r.word).join(', ')}`);
+
+    // Calculate score
+    const currentPlayer = getCurrentPlayer();
+    let totalScore = 0;
+
+    words.forEach(({ word, positions }) => {
+      let wordScore = 0;
+      let wordMultiplier = 1;
+
+      positions.forEach(({ row, col }) => {
+        const letter = gameState.board[row][col];
+        let tileScore = TILE_VALUES[letter];
+        const isNewTile = placedTiles.some(t => t.row === row && t.col === col);
+        
+        if (isNewTile) {
+          const squareType = getSquareType(row, col);
+          
+          if (squareType === 'DL') tileScore *= 2;
+          if (squareType === 'TL') tileScore *= 3;
+          if (squareType === 'DW') wordMultiplier *= 2;
+          if (squareType === 'TW' || squareType === 'START') wordMultiplier *= 3;
+        }
+        
+        wordScore += tileScore;
+      });
+
+      wordScore *= wordMultiplier;
+      totalScore += wordScore;
+    });
+
+    if (placedTiles.length === 7) totalScore += 50;
+
+    currentPlayer.score += totalScore;
+
+    for (let i = 0; i < currentPlayer.rack.length; i++) {
+      if (currentPlayer.rack[i] === null && gameState.tileBag.length > 0) {
+        currentPlayer.rack[i] = gameState.tileBag.shift();
+      }
+    }
+
+    const currentIndex = gameState.players.findIndex(p => p.id === playerId);
+    const nextIndex = (currentIndex + 1) % gameState.players.length;
+    gameState.currentPlayer = gameState.players[nextIndex].id;
+    gameState.turn++;
+
+    setPlacedTiles([]);
+    setSelectedTile(null);
+    setTimeLeft(MOVE_TIME);
+    setIsValidating(false);
+    
+    setTimeout(() => setValidationMessage(''), 3000);
+    
+    await saveGameState(gameState);
+  };
+
+  const skipTurn = async () => {
+    if (gameState.currentPlayer !== playerId) return;
+
+    placedTiles.forEach(({ row, col, letter }) => {
+      gameState.board[row][col] = null;
+      const currentPlayer = getCurrentPlayer();
+      const emptyIndex = currentPlayer.rack.findIndex(t => t === null);
+      currentPlayer.rack[emptyIndex] = letter;
+    });
+
+    const currentIndex = gameState.players.findIndex(p => p.id === playerId);
+    const nextIndex = (currentIndex + 1) % gameState.players.length;
+    gameState.currentPlayer = gameState.players[nextIndex].id;
+    gameState.turn++;
+
+    setPlacedTiles([]);
+    setSelectedTile(null);
+    setTimeLeft(MOVE_TIME);
+    await saveGameState(gameState);
+  };
+
+  if (isJoining) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-amber-50 to-orange-100 p-4 flex items-center justify-center">
+        <div className="bg-white rounded-lg shadow-2xl p-8 max-w-md w-full">
+          <h1 className="text-4xl font-bold text-center text-amber-900 mb-6">Эрудит</h1>
+          <div className="mb-6">
+            <label className="block text-gray-700 font-semibold mb-2">Ваше имя:</label>
+            <input
+              type="text"
+              value={playerName}
+              onChange={(e) => setPlayerName(e.target.value)}
+              className="w-full px-4 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-amber-500"
+              placeholder="Введите имя"
+              maxLength={15}
+            />
+          </div>
+          <button
+            onClick={joinGame}
+            disabled={!playerName.trim()}
+            className="w-full flex items-center justify-center gap-2 px-6 py-3 bg-amber-600 text-white rounded-lg hover:bg-amber-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed font-semibold"
+          >
+            <Users size={20} />
+            Присоединиться к игре
+          </button>
+          {gameState && (
+            <div className="mt-4 text-center text-sm text-gray-600">
+              Игроков в игре: {gameState.players.length}/3
+            </div>
+          )}
+          <button
+            onClick={initializeGame}
+            className="w-full mt-3 px-6 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition-colors font-semibold"
+          >
+            Новая игра
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!gameState || !playerId) return null;
+
+  const currentPlayer = getCurrentPlayer();
+  const isMyTurn = gameState.currentPlayer === playerId;
+  const activePlayer = gameState.players.find(p => p.id === gameState.currentPlayer);
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-amber-50 to-orange-100 p-4">
+      <div className="max-w-6xl mx-auto">
+        <h1 className="text-4xl font-bold text-center text-amber-900 mb-4">Эрудит</h1>
+        
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+          {gameState.players.map((player, idx) => (
+            <div
+              key={player.id}
+              className={`${PLAYER_COLORS[idx]} rounded-lg shadow-lg p-4 ${
+                player.id === gameState.currentPlayer ? 'ring-4 ring-amber-500' : ''
+              }`}
+            >
+              <div className="flex justify-between items-center">
+                <div>
+                  <div className="font-bold text-gray-800">{player.name}</div>
+                  <div className="text-sm text-gray-600">Очки: {player.score}</div>
+                </div>
+                {player.id === gameState.currentPlayer && (
+                  <div className="flex items-center gap-2 text-amber-700">
+                    <Clock size={20} />
+                    <span className="font-bold text-xl">{timeLeft}s</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="bg-white rounded-lg shadow-lg p-4 mb-4">
+          <div className="text-center">
+            {isMyTurn ? (
+              <span className="text-green-600 font-bold">Ваш ход!</span>
+            ) : (
+              <span className="text-gray-600">Ход игрока: <strong>{activePlayer?.name}</strong></span>
+            )}
+          </div>
+          {validationMessage && (
+            <div className={`mt-2 flex items-center justify-center gap-2 ${
+              validationMessage.includes('Недопустимые') ? 'text-red-600' : 'text-green-600'
+            }`}>
+              <AlertCircle size={16} />
+              <span className="font-semibold">{validationMessage}</span>
+            </div>
+          )}
+        </div>
+
+        <div className="bg-amber-900 p-2 rounded-lg shadow-2xl mb-4 inline-block">
+          <div className="grid gap-[2px]" style={{ gridTemplateColumns: `repeat(${BOARD_SIZE}, 1fr)` }}>
+            {gameState.board.map((row, rowIdx) => (
+              row.map((cell, colIdx) => {
+                const squareType = getSquareType(rowIdx, colIdx);
+                const isOccupied = cell !== null;
+                
+                return (
+                  <div
+                    key={`${rowIdx}-${colIdx}`}
+                    onClick={() => handleSquareClick(rowIdx, colIdx)}
+                    className={`w-8 h-8 flex items-center justify-center cursor-pointer border border-amber-800 ${
+                      isOccupied ? 'bg-amber-200' : getSquareColor(squareType)
+                    } hover:opacity-80 transition-opacity`}
+                  >
+                    {isOccupied ? (
+                      <div className="w-full h-full flex items-center justify-center bg-amber-100 text-xs font-bold text-amber-900 border border-amber-300">
+                        {cell}
+                      </div>
+                    ) : (
+                      <span className="text-[8px] font-semibold text-white">
+                        {squareType === 'START' ? '★' : squareType !== 'NORMAL' ? squareType : ''}
+                      </span>
+                    )}
+                  </div>
+                );
+              })
+            ))}
+          </div>
+        </div>
+
+        {currentPlayer && (
+          <div className="bg-white rounded-lg shadow-lg p-4 mb-4">
+            <div className="flex justify-center gap-2 mb-4">
+              {currentPlayer.rack.map((tile, idx) => (
+                <div
+                  key={idx}
+                  onClick={() => handleTileClick(idx)}
+                  className={`w-12 h-12 flex flex-col items-center justify-center bg-amber-100 border-2 rounded cursor-pointer hover:shadow-lg transition-all ${
+                    selectedTile === idx ? 'border-blue-500 scale-110 shadow-lg' : 'border-amber-300'
+                  } ${tile === null ? 'opacity-30' : ''} ${!isMyTurn ? 'cursor-not-allowed opacity-50' : ''}`}
+                >
+                  {tile && (
+                    <>
+                      <span className="text-xl font-bold text-amber-900">{tile}</span>
+                      <span className="text-[8px] text-amber-700">{TILE_VALUES[tile]}</span>
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            <div className="flex gap-2 justify-center flex-wrap">
+              <button
+                onClick={shuffleRack}
+                disabled={!isMyTurn || isValidating}
+                className="flex items-center gap-2 px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Shuffle size={16} />
+                Перемешать
+              </button>
+              <button
+                onClick={() => {
+                  placedTiles.forEach(({ row, col, letter }) => {
+                    gameState.board[row][col] = null;
+                    const emptyIndex = currentPlayer.rack.findIndex(t => t === null);
+                    currentPlayer.rack[emptyIndex] = letter;
+                  });
+                  setPlacedTiles([]);
+                  setSelectedTile(null);
+                  saveGameState(gameState);
+                }}
+                disabled={placedTiles.length === 0 || !isMyTurn || isValidating}
+                className="flex items-center gap-2 px-4 py-2 bg-orange-600 text-white rounded hover:bg-orange-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <RotateCcw size={16} />
+                Вернуть
+              </button>
+              <button
+                onClick={submitMove}
+                disabled={placedTiles.length === 0 || !isMyTurn || isValidating}
+                className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <CheckCircle size={16} />
+                {isValidating ? 'Проверка...' : 'Ход'}
+              </button>
+              <button
+                onClick={skipTurn}
+                disabled={!isMyTurn || isValidating}
+                className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Пропустить
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="bg-white rounded-lg shadow-lg p-4 text-xs text-gray-600">
+          <p className="font-semibold mb-2">Правила:</p>
+          <ul className="list-disc list-inside space-y-1">
+            <li>Выберите плитку и поставьте её на доску</li>
+            <li>Все слова проверяются в Викисловаре</li>
+            <li>TW (×3 слово), DW (×2 слово), TL (×3 букву), DL (×2 букву)</li>
+            <li>Использование всех 7 плиток = +50 очков!</li>
+            <li>У вас есть 2 минуты на ход</li>
+            <li>Игра обновляется автоматически каждые 2 секунды</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default ScrabbleGame;
