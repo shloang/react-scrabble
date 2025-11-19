@@ -1,4 +1,4 @@
-import { BOARD_SIZE, SPECIAL_SQUARES, TILE_VALUES, SquareType, PlacedTile, GameState } from "@shared/schema";
+import { BOARD_SIZE, SPECIAL_SQUARES, TILE_VALUES, SquareType, PlacedTile, GameState, BoardCell } from "@shared/schema";
 
 export function getSquareType(row: number, col: number): SquareType {
   for (const [type, positions] of Object.entries(SPECIAL_SQUARES)) {
@@ -14,7 +14,12 @@ export interface WordInfo {
   positions: { row: number; col: number }[];
 }
 
-export function extractWordsFromBoard(board: (string | null)[][], placedTiles: PlacedTile[]): WordInfo[] {
+function cellLetter(cell: BoardCell): string | null {
+  if (!cell) return null;
+  return (cell as any).letter || null;
+}
+
+export function extractWordsFromBoard(board: BoardCell[][], placedTiles: PlacedTile[]): WordInfo[] {
   const words: WordInfo[] = [];
   
   // Check horizontal words
@@ -23,8 +28,10 @@ export function extractWordsFromBoard(board: (string | null)[][], placedTiles: P
     let positions: { row: number; col: number }[] = [];
     
     for (let col = 0; col < BOARD_SIZE; col++) {
-      if (board[row][col]) {
-        word += board[row][col];
+      const cell = board[row][col];
+      const letter = cellLetter(cell);
+      if (letter) {
+        word += letter;
         positions.push({ row, col });
       } else {
         if (word.length > 1) {
@@ -55,8 +62,10 @@ export function extractWordsFromBoard(board: (string | null)[][], placedTiles: P
     let positions: { row: number; col: number }[] = [];
     
     for (let row = 0; row < BOARD_SIZE; row++) {
-      if (board[row][col]) {
-        word += board[row][col];
+      const cell = board[row][col];
+      const letter = cellLetter(cell);
+      if (letter) {
+        word += letter;
         positions.push({ row, col });
       } else {
         if (word.length > 1) {
@@ -94,7 +103,7 @@ export function extractWordsFromBoard(board: (string | null)[][], placedTiles: P
 
 export function calculateScore(
   words: WordInfo[], 
-  board: (string | null)[][], 
+  board: BoardCell[][], 
   placedTiles: PlacedTile[]
 ): number {
   let totalScore = 0;
@@ -104,10 +113,20 @@ export function calculateScore(
     let wordMultiplier = 1;
 
     positions.forEach(({ row, col }) => {
-      const letter = board[row][col];
+      const cell = board[row][col];
+      const letter = cellLetter(cell);
       if (!letter) return;
       
-      let tileScore = TILE_VALUES[letter] ?? 0;
+      // Determine if this tile is a blank either persistently on the board
+      // (e.g. a BoardCell with blank=true) or if it was placed this turn
+      const placedInfo = placedTiles.find(t => t.row === row && t.col === col) as any;
+      const persistedBlank = !!(cell as any)?.blank;
+      let tileScore = 0;
+      if (persistedBlank || (placedInfo && placedInfo.blank)) {
+        tileScore = 0;
+      } else {
+        tileScore = TILE_VALUES[letter] ?? 0;
+      }
       const isNewTile = placedTiles.some(t => t.row === row && t.col === col);
       
       if (isNewTile) {
@@ -115,8 +134,9 @@ export function calculateScore(
         
         if (squareType === 'DL') tileScore *= 2;
         if (squareType === 'TL') tileScore *= 3;
-        if (squareType === 'DW') wordMultiplier *= 2;
-        if (squareType === 'TW' || squareType === 'START') wordMultiplier *= 3;
+        // START (center) should act as a double-word, not triple-word
+        if (squareType === 'DW' || squareType === 'START') wordMultiplier *= 2;
+        if (squareType === 'TW') wordMultiplier *= 3;
       }
       
       wordScore += tileScore;
@@ -134,7 +154,7 @@ export function calculateScore(
   return totalScore;
 }
 
-export function validatePlacement(board: (string | null)[][], placedTiles: PlacedTile[]): { valid: boolean; error?: string } {
+export function validatePlacement(board: BoardCell[][], placedTiles: PlacedTile[]): { valid: boolean; error?: string } {
   if (placedTiles.length === 0) {
     return { valid: false, error: 'Нет размещенных фишек' };
   }

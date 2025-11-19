@@ -2,6 +2,7 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { BOARD_SIZE, TILE_DISTRIBUTION, MOVE_TIME, type GameState, type Player, gameStateSchema } from "@shared/schema";
+import { extractWordsFromBoard, calculateScore } from "./gameLogic";
 
 export async function registerRoutes(app: Express): Promise<Server> {
   // Get current game state
@@ -144,13 +145,64 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "Invalid game state data", details: result.error });
       }
 
+      // If there is an existing saved state, perform scoring validation
+      const previous = await storage.getGameState();
+      const incoming = result.data as GameState;
+
+      // If there are more moves in the incoming state, inspect the last move
+      const prevMoves = previous?.moves?.length || 0;
+      const newMoves = incoming.moves?.length || 0;
+
+      if (previous && newMoves > prevMoves && incoming.moves) {
+        const lastMove = incoming.moves[incoming.moves.length - 1];
+        // Only validate scoring for 'play' moves
+        if (lastMove.type !== 'skip' && lastMove.type !== 'exchange') {
+          // Prefer placedTiles provided by the client in move.meta. Fallback to board diff.
+          let placedTiles: { row: number; col: number; letter: string }[] = [];
+          if (lastMove.meta && Array.isArray(lastMove.meta.placedTiles)) {
+            placedTiles = lastMove.meta.placedTiles as any;
+            } else {
+            for (let r = 0; r < BOARD_SIZE; r++) {
+              for (let c = 0; c < BOARD_SIZE; c++) {
+                const prevCell = previous.board[r][c];
+                const newCell = incoming.board[r][c];
+                if ((prevCell === null || prevCell === undefined) && newCell !== null && newCell !== undefined) {
+                  // newCell may be a BoardCell object; extract letter if present
+                  const letter = (newCell as any)?.letter ?? newCell;
+                  placedTiles.push({ row: r, col: c, letter });
+                }
+              }
+            }
+          }
+
+          // Derive words and expected score
+          const words = extractWordsFromBoard(incoming.board, placedTiles as any);
+          const expectedScore = calculateScore(words, incoming.board, placedTiles as any);
+
+          // Find the player whose score increased (should be the player in lastMove.playerId)
+          const prevPlayer = previous.players.find(p => p.id === lastMove.playerId);
+          const newPlayer = incoming.players.find(p => p.id === lastMove.playerId);
+          const prevScore = prevPlayer?.score ?? 0;
+          const newScore = newPlayer?.score ?? 0;
+          const delta = newScore - prevScore;
+
+          // Overwrite the client's reported move score with the server-computed expected score
+          lastMove.score = expectedScore;
+
+          // Update the incoming player's score to be previous + expectedScore so server is authoritative
+          if (newPlayer) {
+            newPlayer.score = (prevPlayer?.score ?? 0) + expectedScore;
+          }
+        }
+      }
+
       await storage.saveGameState(result.data);
-      
+
       // Verify save worked
       const saved = await storage.getGameState();
       console.log("Game state saved. Board center:", saved?.board[7]?.slice(6, 10));
-      
-      res.json({ success: true });
+
+      res.json({ success: true, gameState: saved });
     } catch (error) {
       console.error("Failed to update game state:", error);
       res.status(500).json({ error: "Failed to update game state" });
@@ -161,18 +213,28 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.get("/api/validate-word/:word", async (req, res) => {
     try {
       const word = req.params.word.toLowerCase();
-      const url = `https://ru.wiktionary.org/w/api.php?action=query&titles=${encodeURIComponent(word)}&format=json&origin=*`;
-      
+      // Use the extracts API to get a short plain-text description
+      const url = `https://ru.wiktionary.org/w/api.php?action=query&titles=${encodeURIComponent(word)}&prop=extracts&exintro=1&explaintext=1&format=json&origin=*`;
+
       const response = await fetch(url);
       const data = await response.json();
-      
-      const pages = data.query.pages;
+
+      const pages = data.query?.pages || {};
       const pageId = Object.keys(pages)[0];
-      
+
       // If pageId is -1, the page doesn't exist
       const isValid = pageId !== '-1';
-      
-      res.json({ word, isValid });
+
+      let extract: string | null = null;
+      if (isValid) {
+        extract = pages[pageId]?.extract || null;
+        // Debug log to help troubleshoot missing extracts
+        console.log('[validate-word] fetched', { word, pageId, hasExtract: !!extract, pageKeys: Object.keys(pages).slice(0,5) });
+        // Trim long extracts to a reasonable length for UI
+        if (extract && extract.length > 1000) extract = extract.slice(0, 1000) + '…';
+      }
+
+      res.json({ word, isValid, extract });
     } catch (error) {
       res.status(500).json({ error: "Failed to validate word" });
     }

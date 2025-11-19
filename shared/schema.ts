@@ -45,6 +45,7 @@ export interface PlacedTile {
   row: number;
   col: number;
   letter: string;
+  blank?: boolean;
 }
 
 export interface Move {
@@ -58,8 +59,10 @@ export interface Move {
   meta?: Record<string, any> | null;
 }
 
+export type BoardCell = { letter: string; blank?: boolean } | null;
+
 export interface GameState {
-  board: (string | null)[][];
+  board: BoardCell[][];
   tileBag: string[];
   players: Player[];
   currentPlayer: string | null;
@@ -74,8 +77,13 @@ export const playerSchema = z.object({
   score: z.number(),
 });
 
+export const boardCellSchema = z.object({
+  letter: z.string(),
+  blank: z.boolean().optional()
+}).nullable();
+
 export const gameStateSchema = z.object({
-  board: z.array(z.array(z.string().nullable())),
+  board: z.array(z.array(boardCellSchema)),
   tileBag: z.array(z.string()),
   players: z.array(playerSchema),
   currentPlayer: z.string().nullable(),

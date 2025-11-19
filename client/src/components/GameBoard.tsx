@@ -1,12 +1,13 @@
-import { BOARD_SIZE, SPECIAL_SQUARES, SquareType, PlacedTile } from "@shared/schema";
+import { BOARD_SIZE, SPECIAL_SQUARES, SquareType, PlacedTile, BoardCell } from "@shared/schema";
 import BoardSquare from "./BoardSquare";
 
 interface GameBoardProps {
-  board: (string | null)[][];
+  board: BoardCell[][];
   placedTiles: PlacedTile[];
   onSquareClick?: (row: number, col: number) => void;
   onTileDrop?: (row: number, col: number, data: any) => void;
   placedWordStatuses?: { word: string; positions: { row: number; col: number }[]; status: 'valid' | 'invalid' | 'checking' }[];
+  typingCursor?: { row: number; col: number; direction: 'right' | 'down' } | null;
 }
 
 function getSquareType(row: number, col: number): SquareType {
@@ -18,7 +19,7 @@ function getSquareType(row: number, col: number): SquareType {
   return 'NORMAL';
 }
 
-export default function GameBoard({ board, placedTiles, onSquareClick, onTileDrop, placedWordStatuses }: GameBoardProps) {
+export default function GameBoard({ board, placedTiles, onSquareClick, onTileDrop, placedWordStatuses, typingCursor }: GameBoardProps) {
   return (
     <div className="w-full max-w-[800px] mx-auto" data-testid="game-board">
       <div 
@@ -34,6 +35,9 @@ export default function GameBoard({ board, placedTiles, onSquareClick, onTileDro
             const isNewlyPlaced = placedTiles.some(
               t => t.row === rowIndex && t.col === colIndex
             );
+            const isBlankPlaced = (placedTiles as any).some(
+              (t: any) => t.row === rowIndex && t.col === colIndex && t.blank
+            );
             
             // Determine highlight status for this square based on placedWordStatuses
             let highlight: 'valid' | 'invalid' | 'checking' | null = null;
@@ -46,14 +50,22 @@ export default function GameBoard({ board, placedTiles, onSquareClick, onTileDro
               }
             }
 
+            const cellObj = cell as BoardCell;
+            const letter = cellObj ? (cellObj as any).letter : null;
+            const persistentBlank = !!(cellObj && (cellObj as any).blank);
+
+            const isTypingCursor = typingCursor && typingCursor.row === rowIndex && typingCursor.col === colIndex ? typingCursor.direction : null;
+
             return (
               <BoardSquare
                 key={`${rowIndex}-${colIndex}`}
                 row={rowIndex}
                 col={colIndex}
                 type={squareType}
-                letter={cell}
+                letter={letter}
                 isNewlyPlaced={isNewlyPlaced}
+                isBlankPlaced={isBlankPlaced || persistentBlank}
+                isTypingCursor={isTypingCursor}
                 onClick={() => onSquareClick?.(rowIndex, colIndex)}
                 onDrop={(r, c, data) => onTileDrop?.(r, c, data)}
                 highlight={highlight}

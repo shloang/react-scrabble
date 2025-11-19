@@ -32,22 +32,28 @@ export async function joinGame(playerName: string, password: string): Promise<{ 
   return response.json();
 }
 
-export async function updateGameState(gameState: GameState): Promise<void> {
+export type UpdateResponse = { success: boolean; gameState?: GameState };
+
+export async function updateGameState(gameState: GameState): Promise<UpdateResponse> {
   const response = await fetch('/api/game/update', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(gameState)
   });
   if (!response.ok) {
-    throw new Error('Failed to update game state');
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err?.error || 'Failed to update game state');
   }
+  return response.json();
 }
 
-export async function validateWord(word: string): Promise<boolean> {
+export type WordValidation = { isValid: boolean; extract?: string | null; word?: string };
+
+export async function validateWord(word: string): Promise<WordValidation> {
   const response = await fetch(`/api/validate-word/${encodeURIComponent(word)}`);
   if (!response.ok) {
     throw new Error('Failed to validate word');
   }
   const data = await response.json();
-  return data.isValid;
+  return { isValid: !!data.isValid, extract: data.extract || null, word: data.word };
 }

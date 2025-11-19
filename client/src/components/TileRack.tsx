@@ -10,6 +10,8 @@ interface TileRackProps {
   onShuffle: () => void;
   onRecall: () => void;
   canInteract: boolean;
+  onReorder?: (from: number, to: number) => void;
+  onDropFromBoard?: (fromRow: number, fromCol: number, toIndex: number) => void;
 }
 
 export default function TileRack({ 
@@ -19,13 +21,48 @@ export default function TileRack({
   onTileClick, 
   onShuffle, 
   onRecall,
-  canInteract 
+  canInteract,
+  onReorder,
+  onDropFromBoard
 }: TileRackProps) {
   return (
     <div className="w-full" data-testid="tile-rack">
       <div className="grid grid-cols-7 gap-2 mb-4">
         {rack.map((letter, index) => (
-          <div key={index} className="aspect-square">
+          <div
+            key={index}
+            className="aspect-square"
+            onDragOver={(e) => { e.preventDefault(); }}
+            onDragEnter={(e) => { const el = e.currentTarget as HTMLElement; if (el) el.classList.add('drop-target'); }}
+            onDragLeave={(e) => { const el = e.currentTarget as HTMLElement; if (el) el.classList.remove('drop-target'); }}
+            onDrop={(e) => {
+              e.preventDefault();
+              const el = e.currentTarget as HTMLElement; if (el) el.classList.remove('drop-target');
+              try {
+                const d = e.dataTransfer.getData('text/plain');
+                if (!d) return;
+                const parsed = JSON.parse(d);
+                          // If dragging from rack -> reorder
+                          if (parsed?.source === 'rack' && typeof parsed.index === 'number') {
+                            const from = parsed.index as number;
+                            const to = index;
+                            if (from !== to && typeof onReorder === 'function') {
+                              onReorder(from, to);
+                            }
+                          }
+                          // If dragging from board -> drop placed tile into rack slot
+                          if (parsed?.source === 'board' && typeof parsed.fromRow === 'number' && typeof parsed.fromCol === 'number') {
+                            const fromRow = parsed.fromRow as number;
+                            const fromCol = parsed.fromCol as number;
+                            if (typeof onDropFromBoard === 'function') {
+                              onDropFromBoard(fromRow, fromCol, index);
+                            }
+                          }
+              } catch (err) {
+                // ignore
+              }
+            }}
+          >
             <Tile
               letter={letter}
               isEmpty={letter === null}
