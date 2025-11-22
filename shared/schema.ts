@@ -68,6 +68,9 @@ export interface GameState {
   currentPlayer: string | null;
   turn: number;
   moves?: Move[];
+  gameEnded?: boolean;
+  winnerId?: string;
+  endReason?: string;
 }
 
 export const playerSchema = z.object({

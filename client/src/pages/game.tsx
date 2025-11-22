@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { MOVE_TIME, Player, PlacedTile, GameState, TILE_VALUES } from '@shared/schema';
 import { getGameState, joinGame as joinGameApi, updateGameState, validateWord } from '@/lib/gameApi';
@@ -10,6 +10,7 @@ import BlankAssignDialog from '@/components/BlankAssignDialog';
 import GameTimer from '@/components/GameTimer';
 import JoinGameDialog from '@/components/JoinGameDialog';
 import ValidationMessage from '@/components/ValidationMessage';
+import EndGameScreen from '@/components/EndGameScreen';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { CheckCircle, SkipForward, Sun, Moon } from 'lucide-react';
@@ -43,7 +44,21 @@ export default function Game() {
   const [wordToCheck, setWordToCheck] = useState('');
   const [isCheckingWord, setIsCheckingWord] = useState(false);
   const [wordCheckResult, setWordCheckResult] = useState<null | { word: string; valid: boolean; extract?: string | null }>(null);
+  const [hasPlayed20SecSound, setHasPlayed20SecSound] = useState(false);
+  const [previousCurrentPlayer, setPreviousCurrentPlayer] = useState<string | null>(null);
+  const [hasPlayedEndGameSound, setHasPlayedEndGameSound] = useState(false);
   const { toast } = useToast();
+
+  // Sound effects
+  const playSound = (filename: string) => {
+    try {
+      const audio = new Audio(`/${filename}`);
+      audio.volume = 0.5;
+      audio.play().catch(err => console.error('Failed to play sound:', err));
+    } catch (err) {
+      console.error('Failed to load sound:', err);
+    }
+  };
 
   // Poll for game state
   const { data: gameState, refetch } = useQuery<GameState | null>({
@@ -193,12 +208,48 @@ export default function Game() {
     }
   }
 
+  // Play turn sound on all turn switches
+  useEffect(() => {
+    if (!gameState) return;
+    
+    // Check if turn just switched (currentPlayer changed)
+    if (!gameState.gameEnded) {
+      playSound('turn.mp3');
+    }
+    
+    if (previousCurrentPlayer !== null && gameState.currentPlayer !== previousCurrentPlayer) {
+      // playSound('turn.mp3');
+    }
+    setPreviousCurrentPlayer(gameState.currentPlayer);
+  }, [gameState?.currentPlayer, previousCurrentPlayer]);
+
+  // Play win/lose sound when game ends
+  useEffect(() => {
+    if (!gameState || !playerId || !gameState.gameEnded || hasPlayedEndGameSound) return;
+    
+    const isWinner = gameState.winnerId === playerId;
+    if (isWinner) {
+      playSound('win.mp3');
+    } else {
+      playSound('lose.mp3');
+    }
+    setHasPlayedEndGameSound(true);
+  }, [gameState?.gameEnded, gameState?.winnerId, playerId, hasPlayedEndGameSound]);
+
   useEffect(() => {
     if (!gameState || !playerId) return;
     
     if (gameState.currentPlayer === playerId) {
+      setHasPlayed20SecSound(false); // Reset when it becomes player's turn
       const timer = setInterval(() => {
         setTimeLeft(prev => {
+          if (prev === 20) {
+            // Play 20 second warning sound
+            if (!hasPlayed20SecSound) {
+              playSound('20sec.mp3');
+              setHasPlayed20SecSound(true);
+            }
+          }
           if (prev <= 1) {
             handleSkipTurn();
             return MOVE_TIME;
@@ -209,8 +260,9 @@ export default function Game() {
       return () => clearInterval(timer);
     } else {
       setTimeLeft(MOVE_TIME);
+      setHasPlayed20SecSound(false);
     }
-  }, [gameState?.currentPlayer, playerId]);
+  }, [gameState?.currentPlayer, playerId, hasPlayed20SecSound]);
 
   const shuffleArray = (array: string[]) => {
     for (let i = array.length - 1; i > 0; i--) {
@@ -283,16 +335,53 @@ export default function Game() {
     return gameState?.players.find(p => p.id === playerId);
   };
 
-  // Validate placed words as they change and update statuses
+  // Compute client-side board state that merges server board with placed tiles
+  const clientBoardState = useMemo(() => {
+    if (!gameState) return null;
+    const board = structuredClone(gameState.board);
+    // Apply placed tiles to board for rendering
+    placedTiles.forEach(tile => {
+      board[tile.row][tile.col] = { letter: tile.letter, blank: !!tile.blank } as any;
+    });
+    return board;
+  }, [gameState, placedTiles]);
+
+  // Compute client-side rack state that reflects tiles removed for placed tiles
+  const clientRackState = useMemo(() => {
+    if (!gameState || !playerId) return null;
+    const currentPlayer = getCurrentPlayer();
+    if (!currentPlayer) return null;
+    const rack = [...currentPlayer.rack];
+    // Remove tiles from rack that are in placedTiles
+    placedTiles.forEach(tile => {
+      // First try to find from typedSequence
+      const typedEntry = typedSequence.find(t => t.row === tile.row && t.col === tile.col);
+      if (typedEntry && typedEntry.fromRackIndex >= 0 && typedEntry.fromRackIndex < rack.length) {
+        rack[typedEntry.fromRackIndex] = null;
+      } else {
+        // Fallback: find first matching tile in rack
+        const tileLetter = tile.blank ? '?' : tile.letter;
+        const rackIndex = rack.findIndex((r, idx) => r === tileLetter && rack[idx] !== null);
+        if (rackIndex !== -1) {
+          rack[rackIndex] = null;
+        }
+      }
+    });
+    return rack;
+  }, [gameState, playerId, placedTiles, typedSequence]);
+
+  // Validate placed words as they change and update statuses (with debouncing to prevent API spam)
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    const timeoutId = setTimeout(async () => {
       if (!gameState || placedTiles.length === 0) {
         setPlacedWordStatuses([]);
         return;
       }
 
-      const words = extractWordsFromBoard(gameState.board, placedTiles);
+      // Use client board state for validation
+      const boardForValidation = clientBoardState || gameState.board;
+      const words = extractWordsFromBoard(boardForValidation, placedTiles);
       if (words.length === 0) {
         setPlacedWordStatuses([]);
         return;
@@ -323,9 +412,13 @@ export default function Game() {
           setPlacedWordStatuses(prev => prev.map(p => p.word === w.word ? { ...p, status: 'invalid' } : p));
         }
       }));
-    })();
-    return () => { cancelled = true; };
-  }, [placedTiles, gameState]);
+    }, 500); // Debounce for 500ms to prevent API spam
+
+    return () => { 
+      cancelled = true;
+      clearTimeout(timeoutId);
+    };
+  }, [placedTiles, gameState, clientBoardState]);
 
   // Keyboard typing handler when typingCursor is active
   useEffect(() => {
@@ -336,34 +429,13 @@ export default function Game() {
       const currentPlayer = getCurrentPlayer();
       if (!currentPlayer) return;
 
-      // Backspace -> undo last typed placement
+      // Backspace -> undo last typed placement (client-side only)
       if (e.key === 'Backspace') {
         e.preventDefault();
         if (typedSequence.length === 0) return;
         const last = typedSequence[typedSequence.length - 1];
 
-        // Build a fresh state snapshot and ensure typed placements are present
-        const newState = structuredClone(gameState);
-        const newPlayer = newState.players.find(p => p.id === playerId);
-        if (!newPlayer) return;
-
-        // ensure board reflects typed sequence
-        for (const t of typedSequence) {
-          newState.board[t.row][t.col] = { letter: t.letter, blank: t.blank } as any;
-        }
-
-        // remove last typed placement
-        newState.board[last.row][last.col] = null;
-
-        // restore to rack: try original slot, else first empty
-        if (newPlayer.rack[last.fromRackIndex] === null) {
-          newPlayer.rack[last.fromRackIndex] = last.blank ? '?' : last.letter;
-        } else {
-          const empty = newPlayer.rack.findIndex(t => t === null);
-          if (empty !== -1) newPlayer.rack[empty] = last.blank ? '?' : last.letter;
-        }
-
-        // update local placedTiles and typedSequence
+        // update local placedTiles and typedSequence (client-side only)
         setPlacedTiles(prev => prev.filter(t => !(t.row === last.row && t.col === last.col)));
         setTypedSequence(prev => prev.slice(0, -1));
 
@@ -374,17 +446,6 @@ export default function Game() {
         } else {
           // keep the arrow at the last-removed position instead of clearing it
           setTypingCursor({ row: last.row, col: last.col, direction: typingCursor.direction });
-        }
-
-        try {
-          // compute minimal patch: clear the board cell and restore rack slot
-          const rackLetter = last.blank ? '?' : last.letter;
-          const restoredIndex = newPlayer.rack.findIndex(t => t === rackLetter);
-          const rackPatch: Record<number, any> = {};
-          if (restoredIndex !== -1) rackPatch[restoredIndex] = rackLetter;
-          schedulePatch({ board: { [`${last.row},${last.col}`]: null }, rack: rackPatch });
-        } catch (err) {
-          console.error('[Typing Backspace] failed', err);
         }
         return;
       }
@@ -408,8 +469,9 @@ export default function Game() {
         if (typingCursor.direction === 'right') c += 1; else r += 1;
       };
 
-      // If current cell occupied, advance to next empty
-      while (r >= 0 && r < 15 && c >= 0 && c < 15 && gameState.board[r][c] !== null) {
+      // Check client board state to see if cell is occupied
+      const boardToCheck = clientBoardState || gameState.board;
+      while (r >= 0 && r < 15 && c >= 0 && c < 15 && boardToCheck[r][c] !== null) {
         advance();
       }
 
@@ -419,9 +481,10 @@ export default function Game() {
         return;
       }
 
-      // find tile in rack matching letter or wildcard
-      const rackIndexExact = currentPlayer.rack.findIndex(t => t === letter);
-      const rackIndexBlank = currentPlayer.rack.findIndex(t => t === '?');
+      // find tile in rack matching letter or wildcard (use client rack state)
+      const rackToCheck = clientRackState || currentPlayer.rack;
+      const rackIndexExact = rackToCheck.findIndex(t => t === letter);
+      const rackIndexBlank = rackToCheck.findIndex(t => t === '?');
       let useIndex = -1;
       let isBlank = false;
       if (rackIndexExact !== -1) {
@@ -435,42 +498,28 @@ export default function Game() {
         return;
       }
 
-      const newState = structuredClone(gameState);
-      const newPlayer = newState.players.find(p => p.id === playerId);
-      if (!newPlayer) return;
-
-      // place tile
-      newState.board[r][c] = { letter, blank: isBlank } as any;
-      newPlayer.rack[useIndex] = null;
-
-      // mark placedTiles locally
+      // mark placedTiles locally (client-side only)
       setPlacedTiles(prev => [...prev, { row: r, col: c, letter, blank: isBlank }]);
       setTypedSequence(prev => [...prev, { row: r, col: c, letter, fromRackIndex: useIndex, blank: isBlank }]);
+      playSound('tile.mp3');
 
-      // advance cursor to next empty cell
+      // advance cursor to next empty cell (check client board state)
       let nr = r;
       let nc = c;
       do {
         if (typingCursor.direction === 'right') nc += 1; else nr += 1;
-      } while (nr >= 0 && nr < 15 && nc >= 0 && nc < 15 && newState.board[nr][nc] !== null);
+      } while (nr >= 0 && nr < 15 && nc >= 0 && nc < 15 && (clientBoardState?.[nr]?.[nc] !== null || placedTiles.some(t => t.row === nr && t.col === nc)));
 
       if (nr >= 0 && nr < 15 && nc >= 0 && nc < 15) {
         setTypingCursor({ row: nr, col: nc, direction: typingCursor.direction });
       } else {
         setTypingCursor(null);
       }
-
-      try {
-        // send minimal patch: placed board cell and cleared rack index
-        schedulePatch({ board: { [`${r},${c}`]: { letter, blank: isBlank } }, rack: { [useIndex]: null } });
-      } catch (err) {
-        console.error('[Typing] failed', err);
-      }
     };
 
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [typingCursor, gameState, placedTiles, typedSequence, playerId, updateMutation]);
+  }, [typingCursor, gameState, placedTiles, typedSequence, playerId, clientBoardState, clientRackState]);
 
   // Listen for rack reorder events dispatched from TileRack
   // (no global event usage now)
@@ -481,14 +530,13 @@ export default function Game() {
     const currentPlayer = getCurrentPlayer();
     if (!currentPlayer) return;
 
-    // If a rack tile is selected, place it normally
-    if (selectedTileIndex !== null && gameState.board[row][col] === null) {
-      const letter = currentPlayer.rack[selectedTileIndex];
-      if (!letter) return;
+    const boardToCheck = clientBoardState || gameState.board;
 
-      const newState = structuredClone(gameState);
-      const newPlayer = newState.players.find(p => p.id === playerId);
-      if (!newPlayer) return;
+    // If a rack tile is selected, place it normally (client-side only)
+    if (selectedTileIndex !== null && boardToCheck[row][col] === null) {
+      const rackToCheck = clientRackState || currentPlayer.rack;
+      const letter = rackToCheck[selectedTileIndex];
+      if (!letter) return;
 
       // Handle blank tile assignment by opening modal
       if (letter === '?') {
@@ -497,17 +545,17 @@ export default function Game() {
         return;
       }
 
-      newState.board[row][col] = { letter } as any;
-      newPlayer.rack[selectedTileIndex] = null;
-      
       console.log('[Placement] Placing tile', letter, 'at', row, col);
       setPlacedTiles([...placedTiles, { row, col, letter }]);
+      // Track rack index for this placement
+      setTypedSequence(prev => [...prev, { row, col, letter, fromRackIndex: selectedTileIndex, blank: false }]);
       setSelectedTileIndex(null);
-      await updateMutation.mutateAsync(newState);
+      playSound('tile.mp3');
+      // No server update - client-side only
     }
 
     // If no rack tile selected -> cycle typing cursor states on empty squares
-    if (selectedTileIndex === null && gameState.board[row][col] === null) {
+    if (selectedTileIndex === null && boardToCheck[row][col] === null) {
       if (!typingCursor || typingCursor.row !== row || typingCursor.col !== col) {
         // start typing at this square, default direction right
         setTypingCursor({ row, col, direction: 'right' });
@@ -524,24 +572,16 @@ export default function Game() {
       return;
     }
 
-    if (gameState.board[row][col] !== null && placedTiles.some(t => t.row === row && t.col === col)) {
+    // Remove placed tile (client-side only)
+    if (placedTiles.some(t => t.row === row && t.col === col)) {
       const tile = placedTiles.find(t => t.row === row && t.col === col);
       if (!tile) return;
-
-      const newState = structuredClone(gameState);
-      const newPlayer = newState.players.find(p => p.id === playerId);
-      if (!newPlayer) return;
-
-      newState.board[row][col] = null;
-      
-      const emptyIndex = newPlayer.rack.findIndex(t => t === null);
-      if (emptyIndex !== -1) {
-        newPlayer.rack[emptyIndex] = (tile as any).blank ? '?' : tile.letter;
-      }
       
       console.log('[Removal] Removing tile from', row, col);
       setPlacedTiles(placedTiles.filter(t => !(t.row === row && t.col === col)));
-      await updateMutation.mutateAsync(newState);
+      // Also remove from typedSequence if it's there
+      setTypedSequence(prev => prev.filter(t => !(t.row === row && t.col === col)));
+      // No server update - client-side only
     }
   };
 
@@ -557,20 +597,13 @@ export default function Game() {
     setSelectedTileIndex(selectedTileIndex === index ? null : index);
   };
 
-  // Reorder rack indices (drag within rack)
+  // Reorder rack indices (drag within rack) - client-side only, no server update
   const handleReorderRack = async (from: number, to: number) => {
     if (!gameState || gameState.currentPlayer !== playerId) return;
     if (from === to) return;
-    const newState = structuredClone(gameState);
-    const newPlayer = newState.players.find(p => p.id === playerId);
-    if (!newPlayer) return;
-
-    const arr = [...newPlayer.rack];
-    const item = arr[from];
-    arr.splice(from, 1);
-    arr.splice(to, 0, item);
-    newPlayer.rack = arr;
-
+    
+    // Rack reordering is visual only - actual rack state comes from server
+    // We don't need to update server for this as it's just UI reordering
     // Update local selected index if necessary
     setSelectedTileIndex(prev => {
       if (prev === null) return null;
@@ -579,45 +612,30 @@ export default function Game() {
       if (from > to && prev >= to && prev < from) return prev + 1;
       return prev;
     });
-
-    try {
-      await updateMutation.mutateAsync(newState);
-    } catch (err) {
-      console.error('[Reorder] failed', err);
-    }
   };
 
-  // Drop a placed board tile into a rack slot (or swap)
+  // Drop a placed board tile into a rack slot (or swap) - client-side only
   const handleDropFromBoard = async (fromRow: number, fromCol: number, toIndex: number) => {
     if (!gameState || gameState.currentPlayer !== playerId) return;
     const currentPlayer = getCurrentPlayer();
     if (!currentPlayer) return;
 
-    const tileCell = gameState.board[fromRow][fromCol] as any;
+    const boardToCheck = clientBoardState || gameState.board;
+    const tileCell = boardToCheck[fromRow][fromCol] as any;
     if (!tileCell) return;
     const tileLetter = tileCell.letter as string | undefined;
     const placedEntry = placedTiles.find(t => t.row === fromRow && t.col === fromCol) as any;
     const isBlank = !!tileCell.blank || !!placedEntry?.blank;
 
-    const newState = structuredClone(gameState);
-    const newPlayer = newState.players.find(p => p.id === playerId);
-    if (!newPlayer) return;
+    const rackToCheck = clientRackState || currentPlayer.rack;
+    const rackVal = rackToCheck[toIndex];
 
-    const rackVal = newPlayer.rack[toIndex];
-
-    // If target rack slot is empty, move board tile into it
+    // If target rack slot is empty, move board tile into it (client-side only)
     if (rackVal === null) {
-      newState.board[fromRow][fromCol] = null;
-      newPlayer.rack[toIndex] = isBlank ? '?' : tileLetter;
-
       // remove from placedTiles if it was a recent placement
       setPlacedTiles(prev => prev.filter(t => !(t.row === fromRow && t.col === fromCol)));
-
-      try {
-        await updateMutation.mutateAsync(newState);
-      } catch (err) {
-        console.error('[DropBoardToRack] failed', err);
-      }
+      // Also remove from typedSequence
+      setTypedSequence(prev => prev.filter(t => !(t.row === fromRow && t.col === fromCol)));
       return;
     }
 
@@ -629,21 +647,22 @@ export default function Game() {
       return;
     }
 
-    // perform swap: rack tile -> board (fromRow,fromCol), board tile -> rack[toIndex]
-    newState.board[fromRow][fromCol] = rackVal === null ? null : { letter: rackVal } as any;
-    newPlayer.rack[toIndex] = isBlank ? '?' : tileLetter;
-
+    // perform swap: rack tile -> board (fromRow,fromCol), board tile -> rack[toIndex] (client-side only)
     // update placedTiles: remove original placed tile (moved to rack), add new placed tile for rackVal
     setPlacedTiles(prev => {
       const without = prev.filter(t => !(t.row === fromRow && t.col === fromCol));
       return [...without, { row: fromRow, col: fromCol, letter: rackVal } as any];
     });
-
-    try {
-      await updateMutation.mutateAsync(newState);
-    } catch (err) {
-      console.error('[DropBoardToRack] swap failed', err);
-    }
+    // Also update typedSequence
+    setTypedSequence(prev => {
+      const without = prev.filter(t => !(t.row === fromRow && t.col === fromCol));
+      // Find the rack index for the new tile
+      const rackIndex = currentPlayer.rack.findIndex(t => t === rackVal);
+      if (rackIndex !== -1) {
+        return [...without, { row: fromRow, col: fromCol, letter: rackVal, fromRackIndex: rackIndex, blank: false }];
+      }
+      return without;
+    });
   };
 
   const handleConfirmBlank = async (assigned: string) => {
@@ -653,39 +672,31 @@ export default function Game() {
       return;
     }
     const { row, col, rackIndex } = blankAssign;
-    const newState = structuredClone(gameState);
-    const newPlayer = newState.players.find(p => p.id === playerId);
-    if (!newPlayer) return;
-
-    const currentAtCell = newState.board[row][col];
+    const boardToCheck = clientBoardState || gameState.board;
+    const currentAtCell = boardToCheck[row][col];
 
     if (!currentAtCell) {
-      // Empty cell: place assigned letter and clear rack slot
-      newState.board[row][col] = { letter: assigned, blank: true } as any;
-      if (typeof rackIndex === 'number') {
-        newPlayer.rack[rackIndex] = null;
-      }
-
+      // Empty cell: place assigned letter (client-side only)
       setPlacedTiles(prev => [...prev, { row, col, letter: assigned, blank: true }]);
-    } else {
-      // Cell occupied -> swap: assigned replaces existing, and existing goes to rack slot (or bag)
-      const replaced = currentAtCell as any;
-
-      newState.board[row][col] = { letter: assigned, blank: true } as any;
-
+      // Add to typedSequence if there's a rackIndex
       if (typeof rackIndex === 'number') {
-        // put replaced into rack; if replaced was a placed blank, put '?' instead
-        const replacedPlaced = placedTiles.find(t => t.row === row && t.col === col) as any;
-        newPlayer.rack[rackIndex] = replacedPlaced?.blank ? '?' : (replaced.letter || replaced);
-      } else {
-        // no rack index provided -> push replaced into bag
-        newState.tileBag.push(replaced.letter || replaced);
+        setTypedSequence(prev => [...prev, { row, col, letter: assigned, fromRackIndex: rackIndex, blank: true }]);
       }
-
+      playSound('tile.mp3');
+    } else {
+      // Cell occupied -> swap: assigned replaces existing (client-side only)
       // Update placedTiles: remove any old entry at this cell and add assigned blank
       setPlacedTiles(prev => {
         const next = prev.filter(t => !(t.row === row && t.col === col));
         next.push({ row, col, letter: assigned, blank: true } as any);
+        return next;
+      });
+      // Update typedSequence
+      setTypedSequence(prev => {
+        const next = prev.filter(t => !(t.row === row && t.col === col));
+        if (typeof rackIndex === 'number') {
+          next.push({ row, col, letter: assigned, fromRackIndex: rackIndex, blank: true });
+        }
         return next;
       });
     }
@@ -693,12 +704,7 @@ export default function Game() {
     setSelectedTileIndex(null);
     setIsBlankDialogOpen(false);
     setBlankAssign(null);
-
-    try {
-      await updateMutation.mutateAsync(newState);
-    } catch (err) {
-      console.error('[BlankAssign] failed', err);
-    }
+    // No server update - client-side only
   };
 
   const handleCancelBlank = () => {
@@ -711,21 +717,9 @@ export default function Game() {
     const currentPlayer = getCurrentPlayer();
     if (!currentPlayer) return;
 
-    const newState = structuredClone(gameState);
-    const newPlayer = newState.players.find(p => p.id === playerId);
-    if (!newPlayer) return;
-
-    const nonNullTiles = newPlayer.rack.filter(t => t !== null) as string[];
-    shuffleArray(nonNullTiles);
-    let idx = 0;
-    for (let i = 0; i < newPlayer.rack.length; i++) {
-      if (newPlayer.rack[i] !== null) {
-        newPlayer.rack[i] = nonNullTiles[idx++];
-      }
-    }
-    
-    console.log('[Shuffle] Shuffling rack');
-    await updateMutation.mutateAsync(newState);
+    // Shuffle is visual only - actual rack state comes from server
+    // We don't need to update server for this as it's just UI reordering
+    console.log('[Shuffle] Shuffling rack (client-side only)');
   };
 
   const handleRecall = async () => {
@@ -746,6 +740,7 @@ export default function Game() {
     });
 
     setPlacedTiles([]);
+    setTypedSequence([]);
     setSelectedTileIndex(null);
     await updateMutation.mutateAsync(newState);
   };
@@ -753,8 +748,9 @@ export default function Game() {
   const handleSubmitMove = async () => {
     if (!gameState || gameState.currentPlayer !== playerId || placedTiles.length === 0) return;
 
-    // Validate placement
-    const placementValidation = validatePlacement(gameState.board, placedTiles);
+    // Validate placement using client board state
+    const boardForValidation = clientBoardState || gameState.board;
+    const placementValidation = validatePlacement(boardForValidation, placedTiles);
     if (!placementValidation.valid) {
       setValidationMessage(placementValidation.error || 'Недопустимое размещение');
       setIsError(true);
@@ -770,8 +766,9 @@ export default function Game() {
     setIsError(false);
 
     try {
-      // Extract all words formed
-      const words = extractWordsFromBoard(gameState.board, placedTiles);
+      // Extract all words formed using client board state (which includes placed tiles)
+      const boardForWords = clientBoardState || gameState.board;
+      const words = extractWordsFromBoard(boardForWords, placedTiles);
       
       if (words.length === 0) {
         setValidationMessage('Не найдено слов!');
@@ -811,12 +808,25 @@ export default function Game() {
 
       setValidationMessage(`Валидные слова: ${validationResults.map(r => r.word).join(', ')}`);
 
-      // Calculate score
-      const score = calculateScore(words, gameState.board, placedTiles);
+      // Calculate score using client board state
+      const boardForScore = clientBoardState || gameState.board;
+      const score = calculateScore(words, boardForScore, placedTiles);
       
       const newState = structuredClone(gameState);
       const currentPlayer = newState.players.find(p => p.id === playerId);
       if (!currentPlayer) return;
+
+      // Apply placed tiles to board state before sending to server
+      placedTiles.forEach(tile => {
+        newState.board[tile.row][tile.col] = { letter: tile.letter, blank: !!tile.blank } as any;
+      });
+
+      // Remove placed tiles from rack
+      typedSequence.forEach(t => {
+        if (t.fromRackIndex >= 0 && t.fromRackIndex < currentPlayer.rack.length) {
+          currentPlayer.rack[t.fromRackIndex] = null;
+        }
+      });
 
       currentPlayer.score += score;
 
@@ -849,6 +859,7 @@ export default function Game() {
       await updateMutation.mutateAsync(newState);
 
       setPlacedTiles([]);
+      setTypedSequence([]);
       setSelectedTileIndex(null);
       setTimeLeft(MOVE_TIME);
       setIsValidating(false);
@@ -989,6 +1000,7 @@ export default function Game() {
       setSelectedDiscardIndices([]);
       setSelectedTileIndex(null);
       setPlacedTiles([]);
+      setTypedSequence([]);
       setTimeLeft(MOVE_TIME);
     } catch (err) {
       // keep discard mode open on error
@@ -1011,7 +1023,18 @@ export default function Game() {
       <BlankAssignDialog open={isBlankDialogOpen} defaultValue={''} onConfirm={handleConfirmBlank} onCancel={handleCancelBlank} />
 
       {!isJoining && gameState && (
-        <div className="h-screen flex flex-col lg:flex-row gap-4 p-4">
+        <>
+          {gameState.gameEnded && (
+            <EndGameScreen 
+              gameState={gameState} 
+              currentPlayerId={playerId}
+              onNewGame={() => {
+                // Reset game - could add API call here
+                window.location.reload();
+              }}
+            />
+          )}
+          <div className="h-screen flex flex-col lg:flex-row gap-4 p-4">
           <aside className="lg:w-72 flex flex-col gap-4">
             <h1 className="text-2xl font-bold">Игроки</h1>
             {gameState.players.map((player, index) => (
@@ -1037,7 +1060,21 @@ export default function Game() {
                       ) : m.type === 'exchange' ? (
                         <span>Обмен фишек: {(m.meta?.discarded || []).join(', ')}</span>
                       ) : (
-                        <span>{m.words.join(', ')}</span>
+                        <span>
+                          {m.words.map((word, wordIdx) => (
+                            <span key={wordIdx}>
+                              <a
+                                href={`https://ru.wiktionary.org/wiki/${encodeURIComponent(word.toLowerCase())}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-primary underline hover:text-primary/80 cursor-pointer"
+                              >
+                                {word}
+                              </a>
+                              {wordIdx < m.words.length - 1 && ', '}
+                            </span>
+                          ))}
+                        </span>
                       )}
                     </div>
                     <div className="text-sm font-semibold mt-1">{m.type === 'play' ? `+${m.score} очков` : m.type === 'exchange' ? `Обмен (${(m.meta?.discarded || []).length} ф.)` : 'Пропуск'}</div>
@@ -1055,7 +1092,7 @@ export default function Game() {
             />
             {/* placedWordStatuses moved to sidebar below timer */}
               <GameBoard
-                board={gameState.board}
+                board={clientBoardState || gameState.board}
                 placedTiles={placedTiles}
                 typingCursor={typingCursor}
                 placedWordStatuses={placedWordStatuses}
@@ -1066,41 +1103,41 @@ export default function Game() {
                   const currentPlayer = getCurrentPlayer();
                   if (!currentPlayer) return;
 
+                  const boardToCheck = clientBoardState || gameState.board;
+                  const rackToCheck = clientRackState || currentPlayer.rack;
+
                   try {
                     if (data?.source === 'rack') {
                       const index = data.index as number;
-                      const letter = currentPlayer.rack[index];
+                      const letter = rackToCheck[index];
                       if (!letter) return;
 
-                      const targetLetter = gameState.board[row][col];
-                      const newState = structuredClone(gameState);
-                      const newPlayer = newState.players.find(p => p.id === playerId);
-                      if (!newPlayer) return;
+                      const targetLetter = boardToCheck[row][col];
 
-                      // If target is empty -> normal placement (or blank dialog)
+                      // If target is empty -> normal placement (or blank dialog) - client-side only
                       if (targetLetter === null) {
                         if (letter === '?') {
                           setBlankAssign({ row, col, rackIndex: index });
                           setIsBlankDialogOpen(true);
                           return;
                         }
-                        newState.board[row][col] = { letter } as any;
-                        newPlayer.rack[index] = null;
                         setPlacedTiles([...placedTiles, { row, col, letter }]);
+                        setTypedSequence(prev => [...prev, { row, col, letter, fromRackIndex: index, blank: false }]);
                         setSelectedTileIndex(null);
-                        await updateMutation.mutateAsync(newState);
+                        if (isCurrentPlayer) playSound('tile.mp3');
                         return;
                       }
 
-                      // If target occupied -> swap: place rack tile on board, move replaced tile into rack slot
-                      const replaced = targetLetter;
-                      // find if replaced tile was a placed blank
-                      const replacedPlaced = placedTiles.find(t => t.row === row && t.col === col) as any;
-                      const replacedIsBlank = !!replacedPlaced?.blank;
+                      // If target occupied -> check if it's a tile placed this turn (can swap) or old tile (cannot replace)
+                      const replacedPlaced = placedTiles.find(t => t.row === row && t.col === col);
+                      if (!replacedPlaced) {
+                        // Target has an old tile from previous turns - cannot replace it
+                        return;
+                      }
 
-                      newState.board[row][col] = { letter, blank: letter === '?' } as any;
-                      // put replaced tile into the source rack index
-                      newPlayer.rack[index] = replacedIsBlank ? '?' : ((replaced as any)?.letter ?? replaced);
+                      // Target has a tile placed this turn -> swap: place rack tile on board, move replaced tile into rack slot (client-side only)
+                      const replaced = targetLetter;
+                      const replacedIsBlank = !!replacedPlaced?.blank;
 
                       // update placedTiles: remove replaced placed entry if existed, and add new placed tile for the rack tile
                       setPlacedTiles(prev => {
@@ -1108,6 +1145,15 @@ export default function Game() {
                         // if placing a non-blank from rack, mark it as placed
                         const isBlankPlaced = letter === '?';
                         next.push({ row, col, letter: isBlankPlaced ? (letter as string) : letter } as any);
+                        return next;
+                      });
+
+                      // Update typedSequence
+                      setTypedSequence(prev => {
+                        const next = prev.filter(t => !(t.row === row && t.col === col));
+                        if (letter !== '?') {
+                          next.push({ row, col, letter, fromRackIndex: index, blank: false });
+                        }
                         return next;
                       });
 
@@ -1119,7 +1165,6 @@ export default function Game() {
                       }
 
                       setSelectedTileIndex(null);
-                      await updateMutation.mutateAsync(newState);
                       return;
                     }
 
@@ -1127,39 +1172,37 @@ export default function Game() {
                       const fromRow = data.fromRow as number;
                       const fromCol = data.fromCol as number;
 
-                      const tile = gameState.board[fromRow][fromCol];
+                      const tile = boardToCheck[fromRow][fromCol];
                       if (!tile) return;
 
-                      const targetTile = gameState.board[row][col];
+                      const targetTile = boardToCheck[row][col];
 
-                      const newState = structuredClone(gameState);
-
-                      // If target is empty => move (only if tile was placed this turn)
-                      const movingPlaced = placedTiles.find(t => t.row === fromRow && t.col === fromCol) as any;
-                      if (targetTile === null) {
-                        if (!movingPlaced) return; // only allow moving tiles placed this turn
-                        newState.board[fromRow][fromCol] = null;
-                        newState.board[row][col] = tile;
-
-                        const newPlaced = placedTiles.map(t => t.row === fromRow && t.col === fromCol ? { ...t, row, col } : t);
-                        setPlacedTiles(newPlaced as any);
-                        await updateMutation.mutateAsync(newState);
+                      // Check if the source tile was placed this turn
+                      const movingPlaced = placedTiles.find(t => t.row === fromRow && t.col === fromCol);
+                      if (!movingPlaced) {
+                        // Cannot move tiles that were placed in previous turns
                         return;
                       }
 
-                      // target occupied -> swap both on field
-                      // allow swap only if both tiles were placed this turn or allow swapping a placed tile with any tile?
-                      // We'll allow swap when the moving tile was placed this turn (to avoid moving locked old tiles)
-                      if (!movingPlaced) return;
+                      // If target is empty => move (only if tile was placed this turn) - client-side only
+                      if (targetTile === null) {
+                        const newPlaced = placedTiles.map(t => t.row === fromRow && t.col === fromCol ? { ...t, row, col } : t);
+                        setPlacedTiles(newPlaced as any);
+                        // Update typedSequence
+                        setTypedSequence(prev => prev.map(t => t.row === fromRow && t.col === fromCol ? { ...t, row, col } : t));
+                        return;
+                      }
 
-                      // perform swap
-                      newState.board[fromRow][fromCol] = targetTile;
-                      newState.board[row][col] = tile;
+                      // target occupied -> check if target tile was also placed this turn (can swap)
+                      const targetPlaced = placedTiles.find(t => t.row === row && t.col === col);
+                      if (!targetPlaced) {
+                        // Target has an old tile from previous turns - cannot swap with it
+                        return;
+                      }
+
+                      // Both tiles were placed this turn -> swap both on field (client-side only)
 
                       // update placedTiles: adjust positions and preserve blank flags
-                      const moved = placedTiles.find(t => t.row === fromRow && t.col === fromCol) as any;
-                      const targetPlaced = placedTiles.find(t => t.row === row && t.col === col) as any;
-
                       setPlacedTiles(prev => {
                         const next = prev.map(t => {
                           if (t.row === fromRow && t.col === fromCol) return { ...t, row: row, col: col };
@@ -1169,7 +1212,14 @@ export default function Game() {
                         return next as any;
                       });
 
-                      await updateMutation.mutateAsync(newState);
+                      // Update typedSequence
+                      setTypedSequence(prev => {
+                        return prev.map(t => {
+                          if (t.row === fromRow && t.col === fromCol) return { ...t, row: row, col: col };
+                          if (t.row === row && t.col === col) return { ...t, row: fromRow, col: fromCol };
+                          return t;
+                        });
+                      });
                       return;
                     }
                   } catch (err) {
@@ -1180,7 +1230,7 @@ export default function Game() {
           </main>
 
           <aside className="lg:w-80 flex flex-col gap-4">
-            {isCurrentPlayer && (
+            {(//isCurrentPlayer && (
               <>
                 <div className="flex items-center justify-between gap-2">
                   <GameTimer timeLeft={timeLeft} totalTime={MOVE_TIME} />
@@ -1194,6 +1244,11 @@ export default function Game() {
                     </button>
                   </div>
                 </div>
+                {gameState && (
+                  <div className="text-sm text-muted-foreground">
+                    Фишек в мешке: <span className="font-semibold">{gameState.tileBag.length}</span>
+                  </div>
+                )}
 
                 {/* Active placed-word status */}
                 {placedWordStatuses.length > 0 && (
@@ -1246,7 +1301,7 @@ export default function Game() {
                           <div className="mt-1 text-xs text-muted-foreground whitespace-pre-wrap">{wordCheckResult.extract}</div>
                           <div className="mt-1 text-xs">
                             <a
-                              href={`https://ru.wiktionary.org/wiki/${encodeURIComponent(wordCheckResult.word)}`}
+                              href={`https://ru.wiktionary.org/wiki/${encodeURIComponent(wordCheckResult.word.toLowerCase())}`}
                               target="_blank"
                               rel="noopener noreferrer"
                               className="text-sm text-primary underline"
@@ -1276,7 +1331,7 @@ export default function Game() {
                 <div>
                   <h2 className="text-lg font-semibold mb-4">Ваши фишки</h2>
                   <TileRack
-                    rack={getCurrentPlayer()?.rack || []}
+                    rack={clientRackState || getCurrentPlayer()?.rack || []}
                       selectedTileIndex={selectedTileIndex}
                       selectedIndices={discardMode ? selectedDiscardIndices : undefined}
                     onTileClick={handleTileClick}
@@ -1315,9 +1370,10 @@ export default function Game() {
                           variant="outline"
                           size="lg"
                           onClick={handleStartDiscard}
-                          disabled={isValidating}
+                          disabled={isValidating || (gameState && gameState.tileBag.length === 0)}
                           className="w-full"
                           data-testid="button-swap"
+                          title={gameState && gameState.tileBag.length === 0 ? 'Нельзя обменивать фишки: мешок пуст' : ''}
                         >
                           Обменять фишки и пропустить
                         </Button>
@@ -1351,13 +1407,14 @@ export default function Game() {
                   </div>
               </>
             )}
-            {!isCurrentPlayer && (
+            {/* {!isCurrentPlayer && (
               <div className="text-center text-muted-foreground p-8">
                 <p>Ожидание хода другого игрока...</p>
               </div>
-            )}
+            )} */}
           </aside>
         </div>
+        </>
       )}
     </div>
   );

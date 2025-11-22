@@ -2,7 +2,14 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { BOARD_SIZE, TILE_DISTRIBUTION, MOVE_TIME, type GameState, type Player, gameStateSchema } from "@shared/schema";
-import { extractWordsFromBoard, calculateScore } from "./gameLogic";
+import { extractWordsFromBoard, calculateScore, checkGameEnd } from "./gameLogic";
+import { loadWordDictionary, isWordValid } from "./wordDictionary";
+
+// Load word dictionary on server startup
+const USE_WORD_FILE = process.env.USE_WORD_FILE !== 'false'; // Default to true, set USE_WORD_FILE=false to use wiki API
+if (USE_WORD_FILE) {
+  loadWordDictionary();
+}
 
 export async function registerRoutes(app: Express): Promise<Server> {
   // Get current game state
@@ -202,6 +209,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const saved = await storage.getGameState();
       console.log("Game state saved. Board center:", saved?.board[7]?.slice(6, 10));
 
+      // Check for game end
+      const endCheck = checkGameEnd(saved);
+      if (endCheck.ended) {
+        saved.gameEnded = true;
+        saved.winnerId = endCheck.winnerId;
+        saved.endReason = endCheck.reason;
+        await storage.saveGameState(saved);
+      }
+
       res.json({ success: true, gameState: saved });
     } catch (error) {
       console.error("Failed to update game state:", error);
@@ -209,34 +225,45 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Validate word with Wiktionary
+  // Validate word with Wiktionary or word file
   app.get("/api/validate-word/:word", async (req, res) => {
     try {
       const word = req.params.word.toLowerCase();
-      // Use the extracts API to get a short plain-text description
-      const url = `https://ru.wiktionary.org/w/api.php?action=query&titles=${encodeURIComponent(word)}&prop=extracts&exintro=1&explaintext=1&format=json&origin=*`;
+      
+      if (USE_WORD_FILE) {
+        // Use text file lookup (fast, no API calls)
+        const isValid = isWordValid(word);
+        res.json({ word, isValid, extract: null });
+      } else {
+        // Use Wiktionary API (slower, requires internet, can get rate limited)
+        const url = `https://ru.wiktionary.org/w/api.php?action=query&titles=${encodeURIComponent(word)}&prop=extracts&exintro=1&explaintext=1&format=json`;
 
-      const response = await fetch(url);
-      const data = await response.json();
+        const response = await fetch(url);
+        if (!response.ok) {
+          throw new Error(`Wiki API returned ${response.status}: ${response.statusText}`);
+        }
+        const data = await response.json();
 
-      const pages = data.query?.pages || {};
-      const pageId = Object.keys(pages)[0];
+        const pages = data.query?.pages || {};
+        const pageId = Object.keys(pages)[0];
 
-      // If pageId is -1, the page doesn't exist
-      const isValid = pageId !== '-1';
+        // If pageId is -1, the page doesn't exist
+        const isValid = pageId !== '-1';
 
-      let extract: string | null = null;
-      if (isValid) {
-        extract = pages[pageId]?.extract || null;
-        // Debug log to help troubleshoot missing extracts
-        console.log('[validate-word] fetched', { word, pageId, hasExtract: !!extract, pageKeys: Object.keys(pages).slice(0,5) });
-        // Trim long extracts to a reasonable length for UI
-        if (extract && extract.length > 1000) extract = extract.slice(0, 1000) + '…';
+        let extract: string | null = null;
+        if (isValid) {
+          extract = pages[pageId]?.extract || null;
+          // Debug log to help troubleshoot missing extracts
+          console.log('[validate-word] fetched', { word, pageId, hasExtract: !!extract, pageKeys: Object.keys(pages).slice(0,5) });
+          // Trim long extracts to a reasonable length for UI
+          if (extract && extract.length > 1000) extract = extract.slice(0, 1000) + '…';
+        }
+
+        res.json({ word, isValid, extract });
       }
-
-      res.json({ word, isValid, extract });
     } catch (error) {
-      res.status(500).json({ error: "Failed to validate word" });
+      console.error('[validate-word] Error:', error);
+      res.status(500).json({ error: "Failed to validate word", details: error instanceof Error ? error.message : String(error) });
     }
   });
 

@@ -96,8 +96,8 @@ export default function Tile({ letter, isSelected, isEmpty, isBlank, onClick, cl
           fontSize: pointsFontSize + 'px',
           padding: Math.max(2, Math.round(tileSize * 0.03)) + 'px ' + Math.max(4, Math.round(tileSize * 0.06)) + 'px',
           borderRadius: Math.max(6, Math.round(tileSize * 0.06)) + 'px',
-          right: Math.max(4, Math.round(tileSize * 0.04)) + 'px',
-          bottom: Math.max(4, Math.round(tileSize * 0.04)) + 'px'
+          right: '4%',
+          bottom: '4%'
         } : undefined}
       >
         {points}
