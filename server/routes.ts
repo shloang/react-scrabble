@@ -203,11 +203,77 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
       }
 
-      await storage.saveGameState(result.data);
+      // Reconcile tile bag to ensure counts match the canonical distribution
+      // This prevents accidental duplication or loss of tiles caused by clients
+      // or race conditions. We compute expected remaining tiles as: distribution
+      // minus tiles currently on board and tiles in players' racks, then
+      // rebuild and shuffle the bag accordingly.
+      const incomingState = result.data as GameState;
+      try {
+        const expected: Record<string, number> = {};
+        Object.entries(TILE_DISTRIBUTION).forEach(([ltr, cnt]) => expected[ltr] = cnt);
+
+        // subtract board tiles
+        for (let r = 0; r < BOARD_SIZE; r++) {
+          for (let c = 0; c < BOARD_SIZE; c++) {
+            const cell = incomingState.board[r][c] as any;
+            if (cell && cell.letter) {
+              // If the cell was a blank (wildcard) assigned to a letter, it should
+              // consume a '?' from the distribution, not the displayed letter.
+              const L = cell.blank ? '?' : (cell.letter as string);
+              if (expected[L] !== undefined) expected[L] = Math.max(0, expected[L] - 1);
+            }
+          }
+        }
+
+        // subtract tiles in player racks
+        for (const p of incomingState.players) {
+          for (const t of p.rack) {
+            if (t !== null && expected[t] !== undefined) {
+              expected[t] = Math.max(0, expected[t] - 1);
+            }
+          }
+        }
+
+        // build new bag from remaining counts
+        const rebuilt: string[] = [];
+        for (const [ltr, cnt] of Object.entries(expected)) {
+          for (let i = 0; i < cnt; i++) rebuilt.push(ltr);
+        }
+
+        // If the incoming bag length differs from rebuilt, replace and shuffle
+        if (!Array.isArray(incomingState.tileBag) || incomingState.tileBag.length !== rebuilt.length) {
+          incomingState.tileBag = rebuilt;
+        } else {
+          // Quick sanity: check multiset equality; if mismatch, replace
+          const countBag: Record<string, number> = {};
+          for (const x of incomingState.tileBag || []) countBag[x] = (countBag[x] || 0) + 1;
+          let mismatch = false;
+          for (const [ltr, cnt] of Object.entries(expected)) {
+            if ((countBag[ltr] || 0) !== cnt) { mismatch = true; break; }
+          }
+          if (mismatch) incomingState.tileBag = rebuilt;
+        }
+
+        // shuffle the rebuilt bag to avoid deterministic order
+        for (let i = incomingState.tileBag.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [incomingState.tileBag[i], incomingState.tileBag[j]] = [incomingState.tileBag[j], incomingState.tileBag[i]];
+        }
+      } catch (err) {
+        console.error('[TileBag Reconcile] failed', err);
+      }
+
+      await storage.saveGameState(incomingState);
 
       // Verify save worked
       const saved = await storage.getGameState();
       console.log("Game state saved. Board center:", saved?.board[7]?.slice(6, 10));
+
+      if (!saved) {
+        // Shouldn't happen, but return the incoming state as fallback
+        return res.json({ success: true, gameState: incomingState });
+      }
 
       // Check for game end
       const endCheck = checkGameEnd(saved);

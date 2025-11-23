@@ -111,7 +111,8 @@ export function calculateScore(
         if (squareType === 'TW') {
           wordMultiplier *= 3;
           wordScore += baseValue;
-        } else if (squareType === 'DW') {
+        } else if (squareType === 'DW' || squareType === 'START') {
+          // START (center) counts as a double-word for the first move
           wordMultiplier *= 2;
           wordScore += baseValue;
         } else if (squareType === 'TL') {

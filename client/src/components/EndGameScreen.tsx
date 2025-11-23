@@ -1,4 +1,5 @@
 import { GameState, Player, Move } from "@shared/schema";
+import { useEffect } from 'react';
 import { Card } from "@/components/ui/card";
 import { Trophy, Award, Target, BookOpen } from "lucide-react";
 
@@ -6,9 +7,11 @@ interface EndGameScreenProps {
   gameState: GameState;
   currentPlayerId: string | null;
   onNewGame?: () => void;
+  onClose?: () => void;
+  onMinimize?: () => void;
 }
 
-export default function EndGameScreen({ gameState, currentPlayerId, onNewGame }: EndGameScreenProps) {
+export default function EndGameScreen({ gameState, currentPlayerId, onNewGame, onClose, onMinimize }: EndGameScreenProps) {
   const winner = gameState.players.find(p => p.id === gameState.winnerId);
   const currentPlayer = gameState.players.find(p => p.id === currentPlayerId);
   const isWinner = winner?.id === currentPlayerId;
@@ -51,9 +54,43 @@ export default function EndGameScreen({ gameState, currentPlayerId, onNewGame }:
     }
   }
 
+  // allow backdrop click or escape key to close when `onClose` is provided
+  useEffect(() => {
+    if (!onClose) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <Card className="max-w-2xl w-full p-8 space-y-6">
+    <div
+      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+      onClick={() => { if (onClose) onClose(); }}
+    >
+      <Card className="max-w-2xl w-full p-8 space-y-6" onClick={(e) => e.stopPropagation()}>
+        <div className="absolute right-4 top-4 flex gap-2">
+          {onMinimize && (
+            <button
+              aria-label="Minimize"
+              onClick={onMinimize}
+              className="p-2 rounded-md hover:bg-muted/20"
+              title="Свернуть"
+            >
+              —
+            </button>
+          )}
+          {onClose && (
+            <button
+              aria-label="Close"
+              onClick={onClose}
+              className="p-2 rounded-md hover:bg-muted/20"
+              title="Закрыть"
+            >
+              ✕
+            </button>
+          )}
+        </div>
         <div className="text-center">
           <div className={`text-6xl mb-4 ${isWinner ? 'text-yellow-500' : 'text-gray-400'}`}>
             {isWinner ? '🏆' : '😔'}
@@ -154,4 +191,5 @@ export default function EndGameScreen({ gameState, currentPlayerId, onNewGame }:
     </div>
   );
 }
+
 

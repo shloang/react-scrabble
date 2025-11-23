@@ -8,6 +8,7 @@ interface GameBoardProps {
   onTileDrop?: (row: number, col: number, data: any) => void;
   placedWordStatuses?: { word: string; positions: { row: number; col: number }[]; status: 'valid' | 'invalid' | 'checking' }[];
   typingCursor?: { row: number; col: number; direction: 'right' | 'down' } | null;
+  lastMovePositions?: { row: number; col: number }[];
 }
 
 function getSquareType(row: number, col: number): SquareType {
@@ -19,7 +20,7 @@ function getSquareType(row: number, col: number): SquareType {
   return 'NORMAL';
 }
 
-export default function GameBoard({ board, placedTiles, onSquareClick, onTileDrop, placedWordStatuses, typingCursor }: GameBoardProps) {
+export default function GameBoard({ board, placedTiles, onSquareClick, onTileDrop, placedWordStatuses, lastMovePositions, typingCursor }: GameBoardProps) {
   return (
     <div className="w-full max-w-[800px] mx-auto" data-testid="game-board">
       <div 
@@ -35,6 +36,7 @@ export default function GameBoard({ board, placedTiles, onSquareClick, onTileDro
             const isNewlyPlaced = placedTiles.some(
               t => t.row === rowIndex && t.col === colIndex
             );
+            const isLastMovePlaced = (lastMovePositions || []).some(p => p.row === rowIndex && p.col === colIndex);
             const isBlankPlaced = (placedTiles as any).some(
               (t: any) => t.row === rowIndex && t.col === colIndex && t.blank
             );
@@ -69,6 +71,7 @@ export default function GameBoard({ board, placedTiles, onSquareClick, onTileDro
                 onClick={() => onSquareClick?.(rowIndex, colIndex)}
                 onDrop={(r, c, data) => onTileDrop?.(r, c, data)}
                 highlight={highlight}
+                isLastMove={isLastMovePlaced}
               />
             );
           })

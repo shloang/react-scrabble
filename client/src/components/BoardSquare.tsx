@@ -13,6 +13,7 @@ interface BoardSquareProps {
   onClick?: () => void;
   onDrop?: (row: number, col: number, data: any) => void;
   highlight?: 'valid' | 'invalid' | 'checking' | null;
+  isLastMove?: boolean;
 }
 
 const SQUARE_COLORS: Record<SquareType, string> = {
@@ -33,7 +34,7 @@ const SQUARE_LABELS: Record<SquareType, string> = {
   NORMAL: ''
 };
 
-export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isBlankPlaced, isTypingCursor, onClick, onDrop, highlight }: BoardSquareProps) {
+export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isBlankPlaced, isTypingCursor, onClick, onDrop, highlight, isLastMove }: BoardSquareProps) {
   const hasLetter = letter !== null;
 
   const handleDragOver = (e: any) => {
@@ -81,6 +82,7 @@ export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isB
         ${!hasLetter ? SQUARE_COLORS[type] : 'bg-background'}
         ${onClick && !hasLetter ? 'cursor-pointer hover:opacity-80' : ''}
         ${isNewlyPlaced ? 'ring-2 ring-primary ring-inset' : ''}
+        ${isLastMove ? 'ring-2 ring-blue-400/70 ring-offset-0' : ''}
         ${highlight === 'valid' ? 'ring-4 ring-green-400/60' : ''}
         ${highlight === 'invalid' ? 'ring-4 ring-red-400/60' : ''}
         ${highlight === 'checking' ? 'ring-2 ring-yellow-300/60' : ''}
@@ -117,7 +119,7 @@ export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isB
               <Tile
                 letter={letter}
                 isBlank={!!isBlankPlaced}
-                style={fontStyle}
+                style={{ ...fontStyle, compactBadge: true } as any}
                 onClick={onClick}
                 onDragStart={(e) => {
                   try {
@@ -139,6 +141,7 @@ export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isB
                   }
                 }}
                 onDragEnd={() => { document.body.classList.remove('dragging'); }}
+                isSelected={isLastMove}
               />
             </div>
           );

@@ -6,6 +6,7 @@ interface TileProps {
   isSelected?: boolean;
   isEmpty?: boolean;
   isBlank?: boolean;
+  compactBadge?: boolean;
   onClick?: () => void;
   className?: string;
   draggable?: boolean;
@@ -64,8 +65,21 @@ export default function Tile({ letter, isSelected, isEmpty, isBlank, onClick, cl
     return undefined;
   })();
 
-  const mainFontSize = explicitFontSize ?? (tileSize ? Math.max(12, Math.round(tileSize * 0.48)) : undefined);
-  const pointsFontSize = explicitFontSize ? Math.max(8, Math.round(explicitFontSize * 0.28)) : (tileSize ? Math.max(8, Math.round(tileSize * 0.18)) : undefined);
+  // make the main letter a little larger for better readability
+  const mainFontSize = explicitFontSize ?? (tileSize ? Math.max(12, Math.round(tileSize * 0.56)) : undefined);
+
+  // badge sizing: compute a badge diameter and font size relative to tile size
+  const compactBadge = !!(style as any)?.compactBadge;
+  const badgeDiameter = tileSize ? Math.max(10, Math.round(tileSize * (compactBadge ? 0.20 : 0.22))) : 14;
+  const pointsFontSize = Math.max(8, Math.round(badgeDiameter * 0.46));
+
+  // compute offset in px so badge scales with tile size (avoid % offsets)
+  // support compact badge mode for board tiles (closer to corner)
+  const offsetFactor = compactBadge ? 0.035 : 0.06;
+  const offsetPx = tileSize ? Math.max(2, Math.round(tileSize * offsetFactor)) : 6;
+
+  // reserve space inside the tile so the main letter never overlaps the badge
+  const reservedCorner = badgeDiameter + offsetPx + Math.round(Math.max(2, tileSize * 0.03));
 
   return (
     <div
@@ -75,7 +89,7 @@ export default function Tile({ letter, isSelected, isEmpty, isBlank, onClick, cl
       onDragStart={onDragStart}
       onDragEnd={onDragEnd}
       className={
-        `w-full aspect-square bg-amber-100 dark:bg-amber-900 rounded-md shadow-md relative
+        `w-full aspect-square bg-amber-100 rounded-md shadow-md relative
         flex items-center justify-center font-bold
         transition-all duration-200
         ${onClick ? 'cursor-pointer hover-elevate active-elevate-2' : ''}
@@ -83,22 +97,27 @@ export default function Tile({ letter, isSelected, isEmpty, isBlank, onClick, cl
         ${isBlank ? 'ring-2 ring-yellow-300/50' : ''}
         ${className}`
       }
-      style={{ fontFamily: 'Noto Sans, sans-serif', ...(style || {}) }}
+      style={{ fontFamily: 'Noto Sans, sans-serif', paddingRight: reservedCorner + 'px', paddingBottom: reservedCorner + 'px', boxSizing: 'border-box', ...(style || {}) }}
       data-testid={`tile-${letter.toLowerCase()}`}
     >
-      <span className="text-foreground" style={mainFontSize ? { fontSize: mainFontSize + 'px', lineHeight: 1 } : undefined}>{letter}</span>
+      <span className="text-black" style={mainFontSize ? { fontSize: mainFontSize + 'px', lineHeight: 1 } : undefined}>{letter}</span>
       {isBlank && (
-        <span className="absolute left-1 top-1 w-3 h-3 rounded-full bg-yellow-400 ring-1 ring-yellow-600/40" aria-hidden />
+        <span className="absolute right-1 top-1 w-3 h-3 rounded-full bg-yellow-400 ring-1 ring-yellow-600/40" aria-hidden />
       )}
       <span
-        className="absolute font-normal text-muted-foreground"
-        style={pointsFontSize ? {
+        className="absolute flex items-center justify-center font-normal text-black"
+        style={{
+          width: badgeDiameter + 'px',
+          height: badgeDiameter + 'px',
           fontSize: pointsFontSize + 'px',
-          padding: Math.max(2, Math.round(tileSize * 0.03)) + 'px ' + Math.max(4, Math.round(tileSize * 0.06)) + 'px',
-          borderRadius: Math.max(6, Math.round(tileSize * 0.06)) + 'px',
-          right: '4%',
-          bottom: '4%'
-        } : undefined}
+          lineHeight: 1,
+          right: offsetPx + 'px',
+          bottom: offsetPx + 'px',
+          borderRadius: Math.max(4, Math.round(badgeDiameter * 0.28)) + 'px',
+          // background: 'rgba(255,255,255,0.85)',
+          padding: Math.max(2, Math.round(tileSize * 0.02)) + 'px',
+          boxShadow: '0 1px 0 rgba(0,0,0,0.06)'
+        }}
       >
         {points}
       </span>
