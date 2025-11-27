@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { MOVE_TIME, Player, PlacedTile, GameState, TILE_VALUES } from '@shared/schema';
-import { getGameState, joinGame as joinGameApi, updateGameState, validateWord } from '@/lib/gameApi';
+import { getGameState, joinGame as joinGameApi, updateGameState, validateWord, sendPreview } from '@/lib/gameApi';
 import { extractWordsFromBoard, calculateScore, validatePlacement } from '@/lib/gameLogic';
 import GameBoard from '@/components/GameBoard';
 import PlayerCard from '@/components/PlayerCard';
@@ -73,10 +73,29 @@ export default function Game() {
   }, [isDark]);
 
   // Sound effects
+  // Sound effects: reuse audio elements and debounce duplicate plays
+  const audioCache = useRef<Record<string, HTMLAudioElement>>({});
+  const lastSoundRef = useRef<{ key: string; ts: number } | null>(null);
   const playSound = (filename: string) => {
     try {
-      const audio = new Audio(`/${filename}`);
-      audio.volume = 0.5;
+      const key = filename;
+      const now = Date.now();
+      // if same sound played very recently, skip to avoid duplicates
+      if (lastSoundRef.current && lastSoundRef.current.key === key && (now - lastSoundRef.current.ts) < 400) return;
+      lastSoundRef.current = { key, ts: now };
+
+      let audio = audioCache.current[key];
+      if (!audio) {
+        audio = new Audio(`/${filename}`);
+        audio.volume = 0.5;
+        audio.preload = 'auto';
+        audioCache.current[key] = audio;
+      }
+
+      // Reset playback to start for short sounds
+      try {
+        audio.currentTime = 0;
+      } catch (err) { /* ignore */ }
       audio.play().catch(err => console.error('Failed to play sound:', err));
     } catch (err) {
       console.error('Failed to load sound:', err);
@@ -265,11 +284,39 @@ export default function Game() {
       const player = gameState.players.find(p => p.id === playerId);
       if (!player) return null;
       const rack = [...player.rack];
+
+      // First, null out indices explicitly recorded by typedSequence (we know
+      // exactly which slot the tile came from).
       for (const t of typedSequence) {
         if (typeof t.fromRackIndex === 'number' && t.fromRackIndex >= 0 && t.fromRackIndex < rack.length) {
           rack[t.fromRackIndex] = null;
         }
       }
+
+      // Some placements may not have recorded a `fromRackIndex` (e.g. swaps or
+      // programmatic placements). To visually reflect local placed tiles we
+      // also consume matching letters from the rack by removing the first
+      // occurrence that isn't already null. This ensures that server pushes
+      // (which contain the server's idea of the rack) don't overwrite the
+      // client's visible placements.
+      const consumedIndexes = new Set<number>();
+      for (const placed of placedTiles) {
+        // If typedSequence already accounted for this placed tile, skip
+        const typed = typedSequence.find(t => t.row === placed.row && t.col === placed.col && typeof t.fromRackIndex === 'number');
+        if (typed && typeof typed.fromRackIndex === 'number') continue;
+
+        // find the first matching letter in the rack that isn't already null/consumed
+        const letterToConsume = placed.blank ? '?' : placed.letter;
+        for (let i = 0; i < rack.length; i++) {
+          if (consumedIndexes.has(i)) continue;
+          if (rack[i] === letterToConsume) {
+            rack[i] = null;
+            consumedIndexes.add(i);
+            break;
+          }
+        }
+      }
+
       return rack;
     }, [gameState, playerId, typedSequence]);
 
@@ -277,6 +324,40 @@ export default function Game() {
     useEffect(() => {
       if (clientRackState) setRackView([...clientRackState]);
     }, [clientRackState]);
+
+    // Periodically send previews to the server so other players can see our
+    // planning placements without committing them. We send every 2s while
+    // the player has local placedTiles; when there are none we clear the
+    // preview on the server for this player.
+    useEffect(() => {
+      let stopped = false;
+      if (!playerId) return;
+      const send = async () => {
+        try {
+          // Only send when we have placed tiles (or to clear them)
+          await sendPreview(playerId, placedTiles.map(t => ({ row: t.row, col: t.col, letter: t.letter, blank: !!t.blank })));
+        } catch (err) {
+          // ignore network errors for now
+        }
+      };
+
+      // Send immediately once, then every 2s while placedTiles exist
+      let interval: number | null = null;
+      (async () => {
+        await send();
+        if (stopped) return;
+        interval = window.setInterval(() => { send(); }, 2000) as unknown as number;
+      })();
+
+      return () => {
+        stopped = true;
+        if (interval) clearInterval(interval as number);
+        // On unmount/cleanup ensure server preview is cleared for this player
+        (async () => {
+          try { await sendPreview(playerId, []); } catch (err) { /* ignore */ }
+        })();
+      };
+    }, [playerId, placedTiles]);
 
     // Compute last move positions (server authoritative) to highlight those tiles
     const lastMovePositions = useMemo(() => {
@@ -336,13 +417,12 @@ export default function Game() {
     // Play turn sound on all turn switches
   useEffect(() => {
     if (!gameState) return;
-    
-    // Check if turn just switched (currentPlayer changed)
-    if (!gameState.gameEnded) {
-      playSound('turn.mp3');
-    }
-    
+
+    // Play turn-change sound only when current player changed (avoid duplicate plays)
     if (previousCurrentPlayer !== null && gameState.currentPlayer !== previousCurrentPlayer) {
+      if (!gameState.gameEnded) {
+        playSound('turn.mp3');
+      }
       // Clear any local planned placements when the turn rotates
       if (placedTiles.length > 0) {
         setPlacedTiles([]);
@@ -896,13 +976,33 @@ export default function Game() {
     const newPlayer = newState.players.find(p => p.id === playerId);
     if (!newPlayer) return;
 
-    placedTiles.forEach(({ row, col, letter, blank }) => {
+    // Return placed tiles to player's rack. Prefer to return to the original
+    // rack index recorded in typedSequence (fromRackIndex). If that isn't
+    // available, put into the first `null` slot. As a last resort overwrite the
+    // first slot to avoid losing tiles.
+    for (const placed of placedTiles) {
+      const { row, col, letter, blank } = placed as any;
       newState.board[row][col] = null;
+
+      // try find typedSequence entry for this placed tile
+      const typed = typedSequence.find(t => t.row === row && t.col === col && typeof t.fromRackIndex === 'number');
+      if (typed && typeof typed.fromRackIndex === 'number') {
+        const idx = typed.fromRackIndex;
+        if (idx >= 0 && idx < newPlayer.rack.length) {
+          newPlayer.rack[idx] = typed.blank ? '?' : typed.letter;
+          continue;
+        }
+      }
+
       const emptyIndex = newPlayer.rack.findIndex(t => t === null);
       if (emptyIndex !== -1) {
         newPlayer.rack[emptyIndex] = blank ? '?' : letter;
+        continue;
       }
-    });
+
+      // last resort: overwrite first slot to avoid dropping the tile entirely
+      newPlayer.rack[0] = blank ? '?' : letter;
+    }
 
     setPlacedTiles([]);
     setTypedSequence([]);
@@ -1294,6 +1394,7 @@ export default function Game() {
                 typingCursor={typingCursor}
                 placedWordStatuses={placedWordStatuses}
                 lastMovePositions={lastMovePositions}
+                previews={gameState?.previews || {}}
                 onSquareClick={handleSquareClick}
                 onTileDrop={async (row: number, col: number, data: any) => {
                   if (!gameState) return;

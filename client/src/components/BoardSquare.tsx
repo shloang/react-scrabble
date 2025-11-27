@@ -14,6 +14,7 @@ interface BoardSquareProps {
   onDrop?: (row: number, col: number, data: any) => void;
   highlight?: 'valid' | 'invalid' | 'checking' | null;
   isLastMove?: boolean;
+  preview?: { letter: string; isBlank?: boolean; playerId?: string } | null;
 }
 
 const SQUARE_COLORS: Record<SquareType, string> = {
@@ -34,7 +35,7 @@ const SQUARE_LABELS: Record<SquareType, string> = {
   NORMAL: ''
 };
 
-export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isBlankPlaced, isTypingCursor, onClick, onDrop, highlight, isLastMove }: BoardSquareProps) {
+export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isBlankPlaced, isTypingCursor, onClick, onDrop, highlight, isLastMove, preview }: BoardSquareProps) {
   const hasLetter = letter !== null;
 
   const handleDragOver = (e: any) => {
@@ -82,7 +83,6 @@ export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isB
         ${!hasLetter ? SQUARE_COLORS[type] : 'bg-background'}
         ${onClick && !hasLetter ? 'cursor-pointer hover:opacity-80' : ''}
         ${isNewlyPlaced ? 'ring-2 ring-primary ring-inset' : ''}
-        ${isLastMove ? 'ring-2 ring-blue-400/70 ring-offset-0' : ''}
         ${highlight === 'valid' ? 'ring-4 ring-green-400/60' : ''}
         ${highlight === 'invalid' ? 'ring-4 ring-red-400/60' : ''}
         ${highlight === 'checking' ? 'ring-2 ring-yellow-300/60' : ''}
@@ -168,6 +168,19 @@ export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isB
                 <path d="M6 11l6 6 6-6" strokeLinecap="round" strokeLinejoin="round" stroke="white" />
               </svg>
             )}
+          </div>
+        </div>
+      )}
+      {/* Preview tile when square is empty */}
+      {!hasLetter && preview && (
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <div className="w-[75%] h-[75%] opacity-70">
+            <Tile
+              letter={preview.letter}
+              isBlank={!!preview.isBlank}
+              style={{ compactBadge: true } as any}
+              isSelected={false}
+            />
           </div>
         </div>
       )}

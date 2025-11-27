@@ -9,6 +9,7 @@ interface GameBoardProps {
   placedWordStatuses?: { word: string; positions: { row: number; col: number }[]; status: 'valid' | 'invalid' | 'checking' }[];
   typingCursor?: { row: number; col: number; direction: 'right' | 'down' } | null;
   lastMovePositions?: { row: number; col: number }[];
+  previews?: Record<string, PlacedTile[]>;
 }
 
 function getSquareType(row: number, col: number): SquareType {
@@ -20,7 +21,7 @@ function getSquareType(row: number, col: number): SquareType {
   return 'NORMAL';
 }
 
-export default function GameBoard({ board, placedTiles, onSquareClick, onTileDrop, placedWordStatuses, lastMovePositions, typingCursor }: GameBoardProps) {
+export default function GameBoard({ board, placedTiles, onSquareClick, onTileDrop, placedWordStatuses, lastMovePositions, typingCursor, previews }: GameBoardProps) {
   return (
     <div className="w-full max-w-[800px] mx-auto" data-testid="game-board">
       <div 
@@ -55,6 +56,20 @@ export default function GameBoard({ board, placedTiles, onSquareClick, onTileDro
             const cellObj = cell as BoardCell;
             const letter = cellObj ? (cellObj as any).letter : null;
             const persistentBlank = !!(cellObj && (cellObj as any).blank);
+            // check previews: pick first preview tile that occupies this square
+            let previewForSquare: { playerId: string; tile: PlacedTile } | null = null;
+            if (previews) {
+              for (const pid of Object.keys(previews)) {
+                const arr = previews[pid] || [];
+                for (const t of arr) {
+                  if (t.row === rowIndex && t.col === colIndex) {
+                    previewForSquare = { playerId: pid, tile: t } as any;
+                    break;
+                  }
+                }
+                if (previewForSquare) break;
+              }
+            }
 
             const isTypingCursor = typingCursor && typingCursor.row === rowIndex && typingCursor.col === colIndex ? typingCursor.direction : null;
 
@@ -72,6 +87,7 @@ export default function GameBoard({ board, placedTiles, onSquareClick, onTileDro
                 onDrop={(r, c, data) => onTileDrop?.(r, c, data)}
                 highlight={highlight}
                 isLastMove={isLastMovePlaced}
+                preview={previewForSquare ? { letter: previewForSquare.tile.letter, isBlank: !!previewForSquare.tile.blank, playerId: previewForSquare.playerId } : null}
               />
             );
           })

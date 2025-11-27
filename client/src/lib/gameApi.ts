@@ -47,6 +47,19 @@ export async function updateGameState(gameState: GameState): Promise<UpdateRespo
   return response.json();
 }
 
+export async function sendPreview(playerId: string, placedTiles: Array<{ row: number; col: number; letter: string; blank?: boolean }>) {
+  const response = await fetch('/api/game/preview', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ playerId, placedTiles })
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err?.error || 'Failed to send preview');
+  }
+  return response.json();
+}
+
 export type WordValidation = { isValid: boolean; extract?: string | null; word?: string };
 
 export async function validateWord(word: string): Promise<WordValidation> {

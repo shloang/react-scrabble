@@ -213,10 +213,92 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const expected: Record<string, number> = {};
         Object.entries(TILE_DISTRIBUTION).forEach(([ltr, cnt]) => expected[ltr] = cnt);
 
-        // subtract board tiles
+        // Build a canonical board to use for counting remaining tiles. We prefer
+        // to start from the previously saved board and then apply only the
+        // validated last play (if any). This prevents clients from accidentally
+        // sending an incoming state that omits tiles (for example during a
+        // skip) and causing the server to think those tiles are back in the bag.
+        const usedBoard = Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(null)) as any[][];
+        if (previous) {
+          // clone previous board into usedBoard
+          for (let r = 0; r < BOARD_SIZE; r++) for (let c = 0; c < BOARD_SIZE; c++) usedBoard[r][c] = previous.board[r][c];
+        } else {
+          // no previous state (rare) — fall back to incoming board
+          for (let r = 0; r < BOARD_SIZE; r++) for (let c = 0; c < BOARD_SIZE; c++) usedBoard[r][c] = incomingState.board[r][c];
+        }
+
+        // If there is a new move and it's a 'play', apply the placed tiles from
+        // that move onto usedBoard so the counts include them. Prefer explicit
+        // meta.placedTiles provided by the client; otherwise fall back to a
+        // diff between previous and incoming.
+        let placedTilesForCount: { row: number; col: number; letter: string; blank?: boolean }[] = [];
+        if (previous && newMoves > prevMoves && incoming.moves && incoming.moves.length > 0) {
+          const lastMove = incoming.moves[incoming.moves.length - 1];
+          if (lastMove && lastMove.type === 'play') {
+            if (lastMove.meta && Array.isArray(lastMove.meta.placedTiles)) {
+              placedTilesForCount = lastMove.meta.placedTiles as any;
+            } else {
+              // compute diff between previous.board and incoming.board
+              for (let r = 0; r < BOARD_SIZE; r++) {
+                for (let c = 0; c < BOARD_SIZE; c++) {
+                  const prevCell = previous.board[r][c] as any;
+                  const newCell = incomingState.board[r][c] as any;
+                  if ((prevCell === null || prevCell === undefined) && newCell !== null && newCell !== undefined) {
+                    const letter = (newCell as any)?.letter ?? newCell;
+                    const blank = !!(newCell && (newCell as any).blank);
+                    placedTilesForCount.push({ row: r, col: c, letter, blank });
+                  }
+                }
+              }
+            }
+
+            // apply placed tiles onto usedBoard
+            for (const t of placedTilesForCount) {
+              usedBoard[t.row][t.col] = { letter: t.letter, blank: !!t.blank };
+            }
+          }
+        }
+
+        // Detect unexplained removals: tiles present in previous.board but missing
+        // from incoming.board that are not accounted for by the validated last play.
+        try {
+          if (previous) {
+            const unexplained: Array<{ row: number; col: number; letter: string } > = [];
+            for (let r = 0; r < BOARD_SIZE; r++) {
+              for (let c = 0; c < BOARD_SIZE; c++) {
+                const prevCell = previous.board[r][c] as any;
+                const newCell = incomingState.board[r][c] as any;
+                if (prevCell && prevCell.letter) {
+                  // previously had a tile but incoming has no tile here
+                  if (!newCell || !newCell.letter) {
+                    const wasExplained = placedTilesForCount.some(p => p.row === r && p.col === c);
+                    if (!wasExplained) {
+                      unexplained.push({ row: r, col: c, letter: prevCell.letter });
+                    }
+                  }
+                }
+              }
+            }
+            if (unexplained.length > 0) {
+              console.warn('[UnexplainedBoardRemovals] incoming update removed tiles not accounted for by last validated play', {
+                ip: req.ip || req.headers['x-forwarded-for'] || null,
+                prevMoves,
+                newMoves,
+                removed: unexplained,
+                lastMoveSummary: (incoming.moves && incoming.moves.length > 0) ? incoming.moves[incoming.moves.length - 1] : null,
+                incomingTileBagLength: Array.isArray(incomingState.tileBag) ? incomingState.tileBag.length : null,
+                incomingPlayerRacks: incomingState.players ? incomingState.players.map(p => ({ id: p.id, rack: p.rack })) : null
+              });
+            }
+          }
+        } catch (err) {
+          console.error('[UnexplainedBoardRemovals] detection failed', err);
+        }
+
+        // subtract tiles found on the usedBoard
         for (let r = 0; r < BOARD_SIZE; r++) {
           for (let c = 0; c < BOARD_SIZE; c++) {
-            const cell = incomingState.board[r][c] as any;
+            const cell = usedBoard[r][c] as any;
             if (cell && cell.letter) {
               // If the cell was a blank (wildcard) assigned to a letter, it should
               // consume a '?' from the distribution, not the displayed letter.
@@ -241,9 +323,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
           for (let i = 0; i < cnt; i++) rebuilt.push(ltr);
         }
 
-        // If the incoming bag length differs from rebuilt, replace and shuffle
+        // If the incoming bag length differs from rebuilt, replace and shuffle.
+        // Otherwise, if the multiset mismatches, replace but keep the client's
+        // ordering where possible to avoid surprising reorders on clients.
+        let replacedBag = false;
         if (!Array.isArray(incomingState.tileBag) || incomingState.tileBag.length !== rebuilt.length) {
           incomingState.tileBag = rebuilt;
+          replacedBag = true;
         } else {
           // Quick sanity: check multiset equality; if mismatch, replace
           const countBag: Record<string, number> = {};
@@ -252,13 +338,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
           for (const [ltr, cnt] of Object.entries(expected)) {
             if ((countBag[ltr] || 0) !== cnt) { mismatch = true; break; }
           }
-          if (mismatch) incomingState.tileBag = rebuilt;
+          if (mismatch) {
+            incomingState.tileBag = rebuilt;
+            replacedBag = true;
+          }
         }
 
-        // shuffle the rebuilt bag to avoid deterministic order
-        for (let i = incomingState.tileBag.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [incomingState.tileBag[i], incomingState.tileBag[j]] = [incomingState.tileBag[j], incomingState.tileBag[i]];
+        // shuffle the rebuilt bag only when we replaced it; otherwise preserve order
+        if (replacedBag) {
+          for (let i = incomingState.tileBag.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [incomingState.tileBag[i], incomingState.tileBag[j]] = [incomingState.tileBag[j], incomingState.tileBag[i]];
+          }
         }
       } catch (err) {
         console.error('[TileBag Reconcile] failed', err);
@@ -330,6 +421,31 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error) {
       console.error('[validate-word] Error:', error);
       res.status(500).json({ error: "Failed to validate word", details: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  // Receive preview placements from the active player (non-authoritative preview only)
+  app.post('/api/game/preview', async (req, res) => {
+    try {
+      const { playerId, placedTiles } = req.body || {};
+      if (!playerId || !Array.isArray(placedTiles)) {
+        return res.status(400).json({ error: 'Invalid preview payload' });
+      }
+
+      const state = await storage.getGameState();
+      if (!state) return res.status(500).json({ error: 'No game state' });
+
+      // attach previews map on state
+      state.previews = state.previews || {};
+      // sanitize placed tiles (row/col/letter)
+      state.previews[playerId] = placedTiles.map((t: any) => ({ row: Number(t.row), col: Number(t.col), letter: String(t.letter), blank: !!t.blank }));
+
+      await storage.saveGameState(state);
+      const saved = await storage.getGameState();
+      return res.json({ success: true, gameState: saved });
+    } catch (err) {
+      console.error('[Preview] failed', err);
+      return res.status(500).json({ error: 'Failed to save preview' });
     }
   });
 

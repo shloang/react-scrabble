@@ -68,6 +68,7 @@ export interface GameState {
   currentPlayer: string | null;
   turn: number;
   moves?: Move[];
+  previews?: Record<string, PlacedTile[]>;
   gameEnded?: boolean;
   winnerId?: string;
   endReason?: string;
@@ -101,6 +102,7 @@ export const gameStateSchema = z.object({
     type: z.enum(['play', 'skip', 'exchange']).optional(),
     meta: z.record(z.any()).nullable().optional()
   })).optional(),
+  previews: z.record(z.array(z.object({ row: z.number(), col: z.number(), letter: z.string(), blank: z.boolean().optional() }))).optional(),
 });
 
 export type InsertPlayer = Omit<Player, 'id'>;
