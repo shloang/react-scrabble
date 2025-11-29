@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { MOVE_TIME, Player, PlacedTile, GameState, TILE_VALUES } from '@shared/schema';
 import { getGameState, joinGame as joinGameApi, updateGameState, validateWord, sendPreview } from '@/lib/gameApi';
@@ -11,6 +11,7 @@ import GameTimer from '@/components/GameTimer';
 import JoinGameDialog from '@/components/JoinGameDialog';
 import ValidationMessage from '@/components/ValidationMessage';
 import EndGameScreen from '@/components/EndGameScreen';
+import VoiceChat from '@/components/VoiceChat_new';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { CheckCircle, SkipForward, Sun, Moon } from 'lucide-react';
@@ -76,6 +77,19 @@ export default function Game() {
   // Sound effects: reuse audio elements and debounce duplicate plays
   const audioCache = useRef<Record<string, HTMLAudioElement>>({});
   const lastSoundRef = useRef<{ key: string; ts: number } | null>(null);
+  const [soundVolume, setSoundVolume] = useState<number>(0.5);
+  const [voiceVolume, setVoiceVolume] = useState<number>(1);
+  const [voicePeerState, setVoicePeerState] = useState<{ peerVolumes: Record<string, number>; peerMuted: Record<string, boolean>; peerStatuses: Record<string, string>; levels: Record<string, number> }>({ peerVolumes: {}, peerMuted: {}, peerStatuses: {}, levels: {} });
+
+  const handleVoiceStateUpdate = useCallback((s: { peerVolumes: Record<string, number>; peerMuted: Record<string, boolean>; peerStatuses: Record<string, string>; levels: Record<string, number> }) => {
+    setVoicePeerState(prev => ({
+      peerVolumes: { ...prev.peerVolumes, ...s.peerVolumes },
+      peerMuted: { ...prev.peerMuted, ...s.peerMuted },
+      peerStatuses: { ...prev.peerStatuses, ...s.peerStatuses },
+      levels: { ...prev.levels, ...s.levels }
+    }));
+  }, [setVoicePeerState]);
+
   const playSound = (filename: string) => {
     try {
       const key = filename;
@@ -87,10 +101,12 @@ export default function Game() {
       let audio = audioCache.current[key];
       if (!audio) {
         audio = new Audio(`/${filename}`);
-        audio.volume = 0.5;
+        audio.volume = soundVolume;
         audio.preload = 'auto';
         audioCache.current[key] = audio;
       }
+      // ensure volume matches current setting
+      try { audio.volume = soundVolume; } catch (err) {}
 
       // Reset playback to start for short sounds
       try {
@@ -101,6 +117,13 @@ export default function Game() {
       console.error('Failed to load sound:', err);
     }
   };
+
+  // Update cached audio elements when soundVolume changes
+  useEffect(() => {
+    for (const k of Object.keys(audioCache.current)) {
+      try { audioCache.current[k].volume = soundVolume; } catch (err) {}
+    }
+  }, [soundVolume]);
 
   // Poll for game state
   const { data: gameState, refetch } = useQuery<GameState | null>({
@@ -641,7 +664,8 @@ export default function Game() {
         return;
       }
 
-      // Backspace -> remove nearest placed tile behind the arrow (client-side only)
+      // Backspace -> if there's a placed tile at the arrow cell, remove it;
+      // otherwise remove the nearest placed tile behind the arrow (client-side only)
       if (e.key === 'Backspace') {
         e.preventDefault();
         if (!typingCursor) return;
@@ -649,20 +673,32 @@ export default function Game() {
         let target: { row: number; col: number } | null = null;
         if (typingCursor.direction === 'right') {
           const row = typingCursor.row;
-          let bestCol = -1;
-          for (const t of placedTiles) {
-            if (t.row === row && t.col < typingCursor.col && t.col > bestCol) {
-              bestCol = t.col;
-              target = { row: t.row, col: t.col };
+          // prefer tile at the same cursor column
+          const exact = placedTiles.find(t => t.row === row && t.col === typingCursor.col);
+          if (exact) {
+            target = { row: exact.row, col: exact.col };
+          } else {
+            let bestCol = -1;
+            for (const t of placedTiles) {
+              if (t.row === row && t.col < typingCursor.col && t.col > bestCol) {
+                bestCol = t.col;
+                target = { row: t.row, col: t.col };
+              }
             }
           }
         } else {
           const col = typingCursor.col;
-          let bestRow = -1;
-          for (const t of placedTiles) {
-            if (t.col === col && t.row < typingCursor.row && t.row > bestRow) {
-              bestRow = t.row;
-              target = { row: t.row, col: t.col };
+          // prefer tile at the same cursor row
+          const exact = placedTiles.find(t => t.col === col && t.row === typingCursor.row);
+          if (exact) {
+            target = { row: exact.row, col: exact.col };
+          } else {
+            let bestRow = -1;
+            for (const t of placedTiles) {
+              if (t.col === col && t.row < typingCursor.row && t.row > bestRow) {
+                bestRow = t.row;
+                target = { row: t.row, col: t.col };
+              }
             }
           }
         }
@@ -1233,19 +1269,19 @@ export default function Game() {
       }
     }
 
-    // Return discarded to bag and shuffle
-    if (discarded.length > 0) {
-      newState.tileBag.push(...discarded);
-      shuffleArray(newState.tileBag);
-    }
-
-    // Draw replacements
+    // Draw replacements first (so discarded tiles are not immediately drawn back)
     for (const idx of indices) {
       if (newState.tileBag.length > 0) {
         newPlayer.rack[idx] = newState.tileBag.shift() || null;
       } else {
         newPlayer.rack[idx] = null;
       }
+    }
+
+    // Now return discarded tiles to the bag and shuffle for future draws
+    if (discarded.length > 0) {
+      newState.tileBag.push(...discarded);
+      shuffleArray(newState.tileBag);
     }
 
     // Advance turn
@@ -1334,17 +1370,61 @@ export default function Game() {
           <div className="h-screen flex flex-col lg:flex-row gap-4 p-4">
           <aside className="lg:w-72 flex flex-col gap-4">
             <h1 className="text-2xl font-bold">Игроки</h1>
-            {gameState.players.map((player, index) => (
-              <PlayerCard
-                key={player.id}
-                player={player}
-                isCurrentPlayer={player.id === gameState.currentPlayer}
-                playerIndex={index}
-              />
-            ))}
+            <div className="flex flex-row gap-2 overflow-x-auto">
+              {gameState.players.map((player, index) => (
+                <PlayerCard
+                  key={player.id}
+                  player={player}
+                  isCurrentPlayer={player.id === gameState.currentPlayer}
+                  playerIndex={index}
+                  voiceMuted={voicePeerState.peerMuted[player.id]}
+                  voiceVolume={voicePeerState.peerVolumes[player.id]}
+                  voiceLevel={voicePeerState.levels[player.id]}
+                  voiceStatus={voicePeerState.peerStatuses[player.id]}
+                  onToggleMute={() => setVoicePeerState(prev => ({ ...prev, peerMuted: { ...prev.peerMuted, [player.id]: !prev.peerMuted[player.id] } }))}
+                  onVolumeChange={(v) => setVoicePeerState(prev => ({ ...prev, peerVolumes: { ...prev.peerVolumes, [player.id]: v } }))}
+                />
+              ))}
+            </div>
+            {/* Voice chat controls (global + background component) */}
+            {playerId && <div className="mt-2"><VoiceChat playerId={playerId} voiceVolume={voiceVolume} playerNames={Object.fromEntries((gameState.players||[]).map(p => [p.id, p.name]))} /></div>}
+            {/* Global sound & voice controls in one themed row */}
+            <div className="mt-2">
+              <div className="flex items-center gap-3">
+                <div className="flex-1">
+                  <div className="text-sm font-medium">Sound</div>
+                  <div className="flex items-center gap-2 mt-1">
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      value={Math.round(soundVolume * 100)}
+                      onChange={(e) => setSoundVolume(Math.max(0, Math.min(100, Number(e.target.value))) / 100)}
+                      className="w-full h-2 accent-primary bg-transparent"
+                    />
+                    <div className="text-xs w-8 text-right">{Math.round(soundVolume * 100)}%</div>
+                  </div>
+                </div>
+
+                <div className="flex-1">
+                  <div className="text-sm font-medium">Voice</div>
+                  <div className="flex items-center gap-2 mt-1">
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      value={Math.round(voiceVolume * 100)}
+                      onChange={(e) => setVoiceVolume(Math.max(0, Math.min(100, Number(e.target.value))) / 100)}
+                      className="w-full h-2 accent-primary bg-transparent"
+                    />
+                    <div className="text-xs w-8 text-right">{Math.round(voiceVolume * 100)}%</div>
+                  </div>
+                </div>
+              </div>
+            </div>
             <div className="mt-4">
               <h2 className="text-lg font-semibold">История ходов</h2>
-              <div className="mt-2 flex flex-col gap-2 max-h-[40vh] overflow-auto">
+              <div className="mt-2 flex flex-col gap-2 max-h-[30vh] overflow-auto history-scroll">
                 {(gameState.moves || []).slice().reverse().map((m, idx) => (
                   <div key={`${m.playerId}-${m.timestamp}-${idx}`} className="p-2 rounded border bg-card">
                     <div className="flex items-center justify-between">

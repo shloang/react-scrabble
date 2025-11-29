@@ -1,5 +1,6 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
+import { WebSocketServer, WebSocket } from 'ws';
 import { storage } from "./storage";
 import { BOARD_SIZE, TILE_DISTRIBUTION, MOVE_TIME, type GameState, type Player, gameStateSchema } from "@shared/schema";
 import { extractWordsFromBoard, calculateScore, checkGameEnd } from "./gameLogic";
@@ -450,6 +451,96 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   const httpServer = createServer(app);
+
+  // Simple WebSocket signaling server for voice chat.
+  try {
+    const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+    console.log('[WebSocket] server listening on /ws');
+    // map playerId -> ws
+    const clients = new Map<string, WebSocket>();
+
+    wss.on('connection', (ws: WebSocket, req) => {
+      console.log('[WebSocket] connection established', req.socket.remoteAddress);
+      let registeredId: string | null = null;
+
+      ws.on('message', (raw) => {
+        try {
+          const msg = JSON.parse(raw.toString());
+          const type = msg.type;
+          if (type === 'join') {
+            const playerId = String(msg.playerId || '');
+            if (!playerId) return;
+            registeredId = playerId;
+            clients.set(playerId, ws);
+
+            // inform the joining client of current peers
+            const peers = Array.from(clients.keys()).filter(id => id !== playerId);
+            console.log('[WebSocket] player joined', playerId, 'peers->', peers);
+            ws.send(JSON.stringify({ type: 'peers', peers }));
+
+            // notify existing peers of the new peer
+            for (const id of Array.from(clients.keys())) {
+              if (id === playerId) continue;
+              const cws = clients.get(id)!;
+              try {
+                console.log('[WebSocket] notifying existing peer', id, 'of new-peer', playerId);
+                cws.send(JSON.stringify({ type: 'new-peer', playerId }));
+              } catch (err) {
+                console.warn('[WebSocket] failed notify existing peer', id, err);
+              }
+            }
+          } else if (type === 'offer' || type === 'answer' || type === 'candidate') {
+            const to = String(msg.to || '');
+            if (!to) return;
+            const target = clients.get(to);
+            console.log('[WebSocket] forwarding', type, 'from', msg.from, 'to', to);
+            if (target) {
+              try {
+                if (target.readyState === WebSocket.OPEN) {
+                  target.send(JSON.stringify(msg));
+                } else {
+                  console.warn('[WebSocket] target not open for', to, 'state=', target.readyState);
+                }
+              } catch (err) {
+                console.error('[WebSocket] failed forwarding', type, 'to', to, err);
+              }
+            } else {
+              console.warn('[WebSocket] no target client found for', to);
+            }
+          } else if (type === 'leave') {
+            const pid = String(msg.playerId || '');
+            if (pid && clients.has(pid)) {
+              clients.delete(pid);
+              // notify others
+              console.log('[WebSocket] player left', pid);
+              for (const id of Array.from(clients.keys())) {
+                const cws = clients.get(id)!;
+                try {
+                  cws.send(JSON.stringify({ type: 'peer-left', playerId: pid }));
+                } catch (err) {
+                  console.warn('[WebSocket] failed to notify peer-left to', id, err);
+                }
+              }
+            }
+          }
+        } catch (err) {
+          // ignore malformed messages
+        }
+      });
+
+      ws.on('close', () => {
+        if (registeredId && clients.has(registeredId)) {
+          clients.delete(registeredId);
+          for (const id of Array.from(clients.keys())) {
+            const cws = clients.get(id)!;
+            try { cws.send(JSON.stringify({ type: 'peer-left', playerId: registeredId })); } catch (err) {}
+          }
+        }
+      });
+    });
+  } catch (err) {
+    console.error('[WebSocket] failed to start signaling server', err);
+  }
 
   return httpServer;
 }

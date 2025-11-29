@@ -296,6 +296,29 @@ html {
   }
 }
 
+/* Themed scrollbar for history and other scrollable panels */
+.history-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--primary)) hsl(var(--card));
+}
+.history-scroll::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+.history-scroll::-webkit-scrollbar-track {
+  background: hsl(var(--card));
+}
+.history-scroll::-webkit-scrollbar-thumb {
+  background-color: hsl(var(--primary));
+  border-radius: 999px;
+  border: 2px solid hsl(var(--card));
+}
+
+/* card-scale: scale typography slightly with viewport for compact cards */
+.card-scale {
+  font-size: clamp(0.8rem, 0.9vw + 0.8rem, 1rem);
+}
+
 /* Drag-and-drop UX helpers */
 @layer utilities {
   .dragging * {
