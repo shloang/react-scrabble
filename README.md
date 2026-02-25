@@ -4,39 +4,13 @@ Open-source Russian Scrabble (Эрудит) — a Scrabble clone and multiplayer
 
 Key topics: Russian Scrabble, Эрудит, Cyrillic Scrabble, Scrabble clone, React Scrabble, TypeScript game, multiplayer board game.
 
-## What this project is
-
-- A Scrabble-style word game for Russian (Cyrillic) words.
-- Frontend built with React 18 + TypeScript and Vite.
-- Backend in Node.js + Express with a pluggable storage layer (in-memory by default, Drizzle/Postgres prepared).
-- Turn-based multiplayer flow with word validation and scoring.
-
-## Why this repo is useful
-
-- Learn how to build a board game UI with React and Tailwind CSS.
-- See an example of client/server separation for game state and validation.
-- Explore pluggable storage patterns and how to swap in a database (Drizzle ORM + PostgreSQL).
-
-## Features
-
-- 15×15 Cyrillic board with standard Scrabble scoring
-- Tile racks, tile bag, turn timers, and move validation
-- REST API endpoints for game operations and word validation
-- In-memory storage with an `IStorage` abstraction for easy DB migration
-
-## Tech stack
-
-- Frontend: React 18, TypeScript, Vite, Tailwind CSS
-- Backend: Node.js, Express, TypeScript
-- Optional DB: Drizzle ORM + PostgreSQL (Neon-ready)
-- Utilities: TanStack Query, nanoid, date-fns
-
 ## Quick start
-Quickest:
+
+### Quickest:
 
 Remix [this project on replit.com](https://replit.com/@GlucoseGuardian/react-scrabble) and run.
 
-Slower option:
+### Slower option:
 
 Install dependencies:
 
@@ -61,6 +35,35 @@ Preview production build:
 ```bash
 npm run preview
 ```
+
+## What this project is
+
+- A Scrabble-style word game for Russian (Cyrillic) words.
+- Frontend built with React 18 + TypeScript and Vite.
+- Backend in Node.js + Express with a pluggable storage layer (in-memory by default, Drizzle/Postgres prepared).
+- Turn-based multiplayer flow with word validation and scoring.
+
+## Why this repo is useful
+
+- It is a game you can play with your friends (if you have any).
+- Learn how to build a board game UI with React and Tailwind CSS.
+- See an example of client/server separation for game state and validation.
+- Explore pluggable storage patterns and how to swap in a database (Drizzle ORM + PostgreSQL).
+
+## Features
+
+- 15×15 Cyrillic board with standard Scrabble scoring
+- Tile racks, tile bag, turn timers, and move validation
+- REST API endpoints for game operations and word validation
+- In-memory storage with an `IStorage` abstraction for easy DB migration
+
+## Tech stack
+
+- Frontend: React 18, TypeScript, Vite, Tailwind CSS
+- Backend: Node.js, Express, TypeScript
+- Optional DB: Drizzle ORM + PostgreSQL (Neon-ready)
+- Utilities: TanStack Query, nanoid, date-fns
+
 
 ## Repository layout
 
