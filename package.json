@@ -7,7 +7,9 @@
     "dev": "NODE_ENV=development tsx server/index.ts",
     "build": "vite build && esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
     "start": "NODE_ENV=production node dist/index.js",
+    "turn:start": "npx node-turn --ports 3478 --username testuser --password testpass --realm react-scrabble",
     "check": "tsc",
+    "turn:dev": "cross-env TURN_EMBED=1 NODE_ENV=development tsx server/index.ts",
     "db:push": "drizzle-kit push"
   },
   "dependencies": {
@@ -92,6 +94,7 @@
     "@types/ws": "^8.5.13",
     "@vitejs/plugin-react": "^4.7.0",
     "autoprefixer": "^10.4.20",
+    "cross-env": "^7.0.3",
     "drizzle-kit": "^0.31.4",
     "esbuild": "^0.25.0",
     "postcss": "^8.4.47",

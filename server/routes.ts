@@ -1,10 +1,14 @@
 import type { Express } from "express";
+import net from 'net';
 import { createServer, type Server } from "http";
 import { WebSocketServer, WebSocket } from 'ws';
 import { storage } from "./storage";
 import { BOARD_SIZE, TILE_DISTRIBUTION, MOVE_TIME, type GameState, type Player, gameStateSchema } from "@shared/schema";
 import { extractWordsFromBoard, calculateScore, checkGameEnd } from "./gameLogic";
 import { loadWordDictionary, isWordValid } from "./wordDictionary";
+import os from 'os';
+import fs from 'fs';
+import path from 'path';
 
 // Load word dictionary on server startup
 const USE_WORD_FILE = process.env.USE_WORD_FILE !== 'false'; // Default to true, set USE_WORD_FILE=false to use wiki API
@@ -13,6 +17,37 @@ if (USE_WORD_FILE) {
 }
 
 export async function registerRoutes(app: Express): Promise<Server> {
+  function createEmptyGameState(): GameState {
+    const bag: string[] = [];
+    Object.entries(TILE_DISTRIBUTION).forEach(([letter, count]) => {
+      for (let i = 0; i < count; i++) {
+        bag.push(letter);
+      }
+    });
+
+    for (let i = bag.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [bag[i], bag[j]] = [bag[j], bag[i]];
+    }
+
+    return {
+      board: Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(null)),
+      tileBag: bag,
+      players: [],
+      currentPlayer: null,
+      turn: 0,
+      moves: [],
+      paused: false,
+      pausedBy: null,
+      turnStart: null,
+      pausedAt: null,
+      gameEnded: false,
+      winnerId: undefined,
+      endReason: undefined,
+      previews: {},
+    };
+  }
+
   // Get current game state
   app.get("/api/game", async (req, res) => {
     try {
@@ -20,6 +55,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json(gameState || null);
     } catch (error) {
       res.status(500).json({ error: "Failed to get game state" });
+    }
+  });
+
+  // Validate a playerId: returns minimal player info if present
+  app.get('/api/player/:id', async (req, res) => {
+    try {
+      const id = String(req.params.id || '');
+      if (!id || typeof id !== 'string') return res.status(400).json({ error: 'Invalid player id' });
+      const state = await storage.getGameState();
+      if (!state || !Array.isArray(state.players)) return res.status(404).json({ error: 'Player not found' });
+      const p = state.players.find(pl => pl.id === id);
+      if (!p) return res.status(404).json({ error: 'Player not found' });
+      // return only minimal public information
+      const out: any = { id: p.id, name: p.name, score: p.score };
+      if ((p as any).avatarUrl) out.avatarUrl = (p as any).avatarUrl;
+      return res.json(out);
+    } catch (err) {
+      console.error('[PlayerValidate] failed', err);
+      return res.status(500).json({ error: 'Failed to validate player' });
     }
   });
 
@@ -46,6 +100,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         currentPlayer: null,
         turn: 0,
         moves: []
+        , paused: false,
+        pausedBy: null,
+        turnStart: null,
+        pausedAt: null
       };
 
       await storage.saveGameState(newGameState);
@@ -91,6 +149,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
           currentPlayer: null,
           turn: 0,
           moves: []
+          , paused: false,
+          pausedBy: null,
+          turnStart: null,
+          pausedAt: null
         };
       }
 
@@ -130,15 +192,64 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Save password for new player
       await storage.setPlayerPassword(playerId, password);
 
-      // Set first player as current player
-      if (gameState.players.length === 1) {
-        gameState.currentPlayer = playerId;
-      }
+      // Do not auto-start or set current player here; game start is explicit
 
       await storage.saveGameState(gameState);
       res.json({ playerId, gameState });
     } catch (error) {
       res.status(500).json({ error: "Failed to join game" });
+    }
+  });
+
+  // Leave game: remove player from current session; if last player leaves, reset session
+  app.post('/api/game/leave', async (req, res) => {
+    try {
+      const playerId = String(req.body?.playerId || '').trim();
+      if (!playerId) return res.status(400).json({ error: 'playerId is required' });
+
+      const state = await storage.getGameState();
+      if (!state || !Array.isArray(state.players)) {
+        return res.json({ success: true, gameState: state || null });
+      }
+
+      const existingIndex = state.players.findIndex(p => p.id === playerId);
+      if (existingIndex === -1) {
+        return res.json({ success: true, gameState: state });
+      }
+
+      const wasCurrentPlayer = state.currentPlayer === playerId;
+      state.players.splice(existingIndex, 1);
+
+      // Remove preview data for this player
+      try {
+        if (state.previews && typeof state.previews === 'object') {
+          delete (state.previews as any)[playerId];
+        }
+      } catch {}
+
+      // If no players remain, terminate/reset session to empty initialized state
+      if (state.players.length === 0) {
+        const resetState = createEmptyGameState();
+        await storage.saveGameState(resetState);
+        return res.json({ success: true, gameState: resetState });
+      }
+
+      // If removed player had the turn, pass turn to next valid player
+      if (wasCurrentPlayer) {
+        const nextIndex = Math.min(existingIndex, state.players.length - 1);
+        state.currentPlayer = state.players[nextIndex]?.id ?? state.players[0]?.id ?? null;
+        state.turnStart = Date.now();
+      } else if (!state.currentPlayer || !state.players.some(p => p.id === state.currentPlayer)) {
+        // Defensive: ensure currentPlayer always references an existing player
+        state.currentPlayer = state.players[0]?.id ?? null;
+        state.turnStart = state.currentPlayer ? Date.now() : null;
+      }
+
+      await storage.saveGameState(state);
+      return res.json({ success: true, gameState: state });
+    } catch (err) {
+      console.error('[Leave] failed', err);
+      return res.status(500).json({ error: 'Failed to leave game' });
     }
   });
 
@@ -155,11 +266,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // If there is an existing saved state, perform scoring validation
       const previous = await storage.getGameState();
+      // Enforce server-side: reject updates if the saved game already ended
+      if (previous && previous.gameEnded) {
+        console.warn('[Update] rejected update: game already ended');
+        return res.status(400).json({ error: 'Game has already ended' });
+      }
       const incoming = result.data as GameState;
 
       // If there are more moves in the incoming state, inspect the last move
       const prevMoves = previous?.moves?.length || 0;
       const newMoves = incoming.moves?.length || 0;
+
+      // Enforce pause: if the saved state is paused, reject any incoming new moves
+      if (previous && previous.paused && newMoves > prevMoves) {
+        console.warn('[Update] rejected update: game is paused (incoming contained new moves)');
+        return res.status(400).json({ error: 'Game is paused' });
+      }
 
       if (previous && newMoves > prevMoves && incoming.moves) {
         const lastMove = incoming.moves[incoming.moves.length - 1];
@@ -210,6 +332,37 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // minus tiles currently on board and tiles in players' racks, then
       // rebuild and shuffle the bag accordingly.
       const incomingState = result.data as GameState;
+      // Adjust server-authoritative timestamps and pause transitions.
+      try {
+        if (previous) {
+          const prevPaused = !!previous.paused;
+          const incPaused = !!incomingState.paused;
+
+          // If we're transitioning to paused, record pausedAt if not set
+          if (!prevPaused && incPaused) {
+            incomingState.pausedAt = incomingState.pausedAt ?? Date.now();
+          }
+
+          // If we're resuming from pause, advance turnStart by pause duration
+          if (prevPaused && !incPaused) {
+            const pausedAt = previous.pausedAt ?? incomingState.pausedAt ?? Date.now();
+            const delta = Date.now() - pausedAt;
+            if (incomingState.turnStart) incomingState.turnStart = (incomingState.turnStart || Date.now()) + delta;
+            else incomingState.turnStart = Date.now();
+            incomingState.pausedAt = null;
+          }
+
+          // When turn advances, reset turnStart to now
+          if (incomingState.currentPlayer !== previous.currentPlayer || (incomingState.turn || 0) > (previous.turn || 0)) {
+            incomingState.turnStart = Date.now();
+          }
+        } else {
+          // No previous state: ensure turnStart exists if there is a current player
+          if (incomingState.currentPlayer && !incomingState.turnStart) incomingState.turnStart = Date.now();
+        }
+      } catch (err) {
+        console.error('[Timestamps] failed to adjust turnStart/pausedAt', err);
+      }
       try {
         const expected: Record<string, number> = {};
         Object.entries(TILE_DISTRIBUTION).forEach(([ltr, cnt]) => expected[ltr] = cnt);
@@ -384,6 +537,78 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Validate word with Wiktionary or word file
+  // Serve the local word list as plain text (one word per line)
+  app.get('/api/wordlist', async (req, res) => {
+    try {
+      const filePath = path.resolve(__dirname, '..', 'attached_assets', 'russian-mnemonic-words.txt');
+      try {
+        const data = await fs.promises.readFile(filePath, 'utf8');
+        res.type('text/plain').send(data);
+      } catch (err: any) {
+        if (err && err.code === 'ENOENT') return res.status(404).json({ error: 'Word list not found' });
+        console.error('[wordlist] read error', err);
+        return res.status(500).json({ error: 'Failed to read word list' });
+      }
+    } catch (err) {
+      console.error('[wordlist] unexpected error', err);
+      res.status(500).json({ error: 'Failed to serve word list' });
+    }
+  });
+
+  // Return cached-ish player stats (basic server-side snapshot)
+  app.get('/api/player-stats/:playerId', async (req, res) => {
+    try {
+      const playerId = String(req.params.playerId || '');
+      if (!playerId) return res.status(400).json({ error: 'playerId required' });
+      const state = await storage.getGameState();
+      if (!state) return res.status(404).json({ error: 'No game state' });
+      const p = state.players.find(x => x.id === playerId);
+      if (!p) return res.status(404).json({ error: 'Player not found' });
+
+      // Currently we only have per-game score info server-side. Return a
+      // minimal cached snapshot. Later this can be replaced by a persistent
+      // stats store that aggregates across games.
+      const snapshot = {
+        playerId: p.id,
+        score: p.score || 0,
+        wins: 0,
+        losses: 0,
+        games: 1,
+        cachedAt: Date.now(),
+        source: 'server-snapshot'
+      };
+      return res.json(snapshot);
+    } catch (err) {
+      console.error('[PlayerStats] failed', err);
+      return res.status(500).json({ error: 'Failed to get player stats' });
+    }
+  });
+
+  // Set or update a player's avatar URL (basic validation)
+  app.post('/api/player/:playerId/avatar', async (req, res) => {
+    try {
+      const playerId = String(req.params.playerId || '');
+      const { avatarUrl } = req.body || {};
+      if (!playerId) return res.status(400).json({ error: 'playerId required' });
+      if (!avatarUrl || typeof avatarUrl !== 'string') return res.status(400).json({ error: 'avatarUrl required' });
+
+      // Basic validation: must be http(s) and reasonably short
+      if (!/^https?:\/\//i.test(avatarUrl) || avatarUrl.length > 200) return res.status(400).json({ error: 'Invalid avatarUrl' });
+
+      const state = await storage.getGameState();
+      if (!state) return res.status(404).json({ error: 'No game state' });
+      const p = state.players.find(x => x.id === playerId);
+      if (!p) return res.status(404).json({ error: 'Player not found' });
+
+      p.avatarUrl = avatarUrl;
+      await storage.saveGameState(state);
+      return res.json({ success: true, avatarUrl });
+    } catch (err) {
+      console.error('[Avatar] failed', err);
+      return res.status(500).json({ error: 'Failed to set avatar' });
+    }
+  });
+
   app.get("/api/validate-word/:word", async (req, res) => {
     try {
       const word = req.params.word.toLowerCase();
@@ -450,18 +675,160 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Provide ICE server configuration to clients. This allows the client
+  // to use a locally-hosted TURN server if environment variables are set.
+  app.get('/api/turn-config', async (req, res) => {
+    try {
+      // Environment-based TURN config. To run a local TURN server you can use
+      // `node-turn` or `coturn`. Example (node-turn):
+      //   npx node-turn --realm=myrealm --username=testuser --password=testpass --ports=3478
+      // Then set TURN_HOST=127.0.0.1 TURN_PORT=3478 TURN_USER=testuser TURN_PASS=testpass
+      const { TURN_HOST, TURN_PORT, TURN_USER, TURN_PASS } = process.env as any;
+      const iceServers: any[] = [];
+      // Always include a public STUN as a fallback
+      iceServers.push({ urls: 'stun:stun.l.google.com:19302' });
+
+      let forceRelay = false;
+      if (TURN_HOST && TURN_PORT && TURN_USER && TURN_PASS) {
+        const url = `turn:${TURN_HOST}:${TURN_PORT}`;
+        iceServers.push({ urls: url, username: TURN_USER, credential: TURN_PASS });
+        // also include secure TURN (turns) if available on a TLS-enabled TURN server
+        const turnsUrl = `turns:${TURN_HOST}:${TURN_PORT}`;
+        iceServers.push({ urls: turnsUrl, username: TURN_USER, credential: TURN_PASS });
+        forceRelay = true;
+      }
+
+      res.json({ iceServers, forceRelay });
+    } catch (err) {
+      console.error('[TurnConfig] failed', err);
+      res.status(500).json({ error: 'Failed to get TURN config' });
+    }
+  });
+
+  // WebSocket health endpoint (info only)
+  app.get('/api/ws-health', async (req, res) => {
+    try {
+      // best-effort: if ws server not started, return empty
+      const info: any = (global as any).__wsHealth || { connected: 0, peers: [] };
+      res.json(info);
+    } catch (err) {
+      res.status(500).json({ error: 'ws-health failed' });
+    }
+  });
+
+  // Start game: shuffle player order, build tile bag, deal racks, and set initial turn
+  app.post('/api/game/start', async (req, res) => {
+    try {
+      const state = await storage.getGameState();
+      if (!state) return res.status(400).json({ error: 'No game to start' });
+      if (!Array.isArray(state.players) || state.players.length === 0) return res.status(400).json({ error: 'No players to start game' });
+
+      // Enforce readiness: all players in lobby must be marked ready.
+      const notReadyPlayers = state.players.filter((p) => !p.ready).map((p) => p.name);
+      if (notReadyPlayers.length > 0) {
+        return res.status(400).json({
+          error: 'Не все игроки готовы',
+          notReadyPlayers,
+        });
+      }
+
+      // Shuffle player order in-place (Fisher-Yates)
+      for (let i = state.players.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [state.players[i], state.players[j]] = [state.players[j], state.players[i]];
+      }
+
+      // build full tile bag from distribution
+      const bag: string[] = [];
+      Object.entries(TILE_DISTRIBUTION).forEach(([letter, count]) => {
+        for (let i = 0; i < count; i++) bag.push(letter);
+      });
+      // shuffle bag
+      for (let i = bag.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [bag[i], bag[j]] = [bag[j], bag[i]];
+      }
+
+      state.tileBag = bag;
+      // deal racks
+      for (const p of state.players) {
+        p.rack = state.tileBag.splice(0, 7);
+        while (p.rack.length < 7) p.rack.push(null);
+        p.score = p.score || 0;
+        p.ready = false; // reset ready flag
+      }
+
+      // reset board/moves and set current player to first player
+      state.board = Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(null));
+      state.moves = [];
+      state.currentPlayer = state.players[0].id;
+      state.turn = 1;
+      state.turnStart = Date.now();
+      state.paused = false;
+      state.pausedAt = null;
+      state.gameEnded = false;
+      state.winnerId = undefined;
+      state.endReason = undefined;
+
+      await storage.saveGameState(state);
+      const saved = await storage.getGameState();
+      return res.json({ success: true, gameState: saved });
+    } catch (err) {
+      console.error('[Start] failed', err);
+      return res.status(500).json({ error: 'Failed to start game' });
+    }
+  });
+
+  // Health check for TURN server reachability (useful for CI)
+  app.get('/api/turn-health', async (req, res) => {
+    try {
+      const host = process.env.TURN_HOST || '127.0.0.1';
+      const port = parseInt(process.env.TURN_PORT || '3478', 10);
+      const timeoutMs = parseInt(process.env.TURN_WAIT_MS || '2000', 10);
+
+      const reachable = await new Promise<boolean>((resolve) => {
+        const socket = new net.Socket();
+        let done = false;
+        const onFail = () => { if (done) return; done = true; try { socket.destroy(); } catch (e) {} resolve(false); };
+        socket.setTimeout(Math.max(500, timeoutMs));
+        socket.once('error', onFail);
+        socket.once('timeout', onFail);
+        socket.connect(port, host, () => { if (done) return; done = true; try { socket.end(); } catch (e) {} resolve(true); });
+      });
+
+      res.json({ host, port, reachable });
+    } catch (err) {
+      res.status(500).json({ error: 'turn-health failed', details: String(err) });
+    }
+  });
+
   const httpServer = createServer(app);
 
-  // Simple WebSocket signaling server for voice chat.
+  // Simple WebSocket signaling server for voice chat with heartbeat and health
   try {
     const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
     console.log('[WebSocket] server listening on /ws');
-    // map playerId -> ws
-    const clients = new Map<string, WebSocket>();
+
+    type ClientRecord = { ws: WebSocket, lastSeen: number };
+    const clients = new Map<string, ClientRecord>();
+
+    const WS_HEARTBEAT_INTERVAL = parseInt(process.env.WS_HEARTBEAT_MS || '30000', 10);
+    const WS_STALE_MS = parseInt(process.env.WS_STALE_MS || '60000', 10);
+
+    // expose basic health info globally for the /api/ws-health route
+    (global as any).__wsHealth = { connected: 0, peers: [] };
 
     wss.on('connection', (ws: WebSocket, req) => {
       console.log('[WebSocket] connection established', req.socket.remoteAddress);
       let registeredId: string | null = null;
+
+      // Update lastSeen on pong
+      ws.on('pong', () => {
+        if (registeredId) {
+          const rec = clients.get(registeredId);
+          if (rec) rec.lastSeen = Date.now();
+        }
+      });
 
       ws.on('message', (raw) => {
         try {
@@ -471,7 +838,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
             const playerId = String(msg.playerId || '');
             if (!playerId) return;
             registeredId = playerId;
-            clients.set(playerId, ws);
+            clients.set(playerId, { ws, lastSeen: Date.now() });
+
+            // update health
+            (global as any).__wsHealth.connected = clients.size;
+            (global as any).__wsHealth.peers = Array.from(clients.keys()).map(id => ({ id, lastSeen: clients.get(id)!.lastSeen }));
 
             // inform the joining client of current peers
             const peers = Array.from(clients.keys()).filter(id => id !== playerId);
@@ -481,7 +852,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             // notify existing peers of the new peer
             for (const id of Array.from(clients.keys())) {
               if (id === playerId) continue;
-              const cws = clients.get(id)!;
+              const cws = clients.get(id)!.ws;
               try {
                 console.log('[WebSocket] notifying existing peer', id, 'of new-peer', playerId);
                 cws.send(JSON.stringify({ type: 'new-peer', playerId }));
@@ -492,14 +863,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
           } else if (type === 'offer' || type === 'answer' || type === 'candidate') {
             const to = String(msg.to || '');
             if (!to) return;
-            const target = clients.get(to);
+            const targetRec = clients.get(to);
             console.log('[WebSocket] forwarding', type, 'from', msg.from, 'to', to);
-            if (target) {
+            if (targetRec) {
               try {
-                if (target.readyState === WebSocket.OPEN) {
-                  target.send(JSON.stringify(msg));
+                if (targetRec.ws.readyState === WebSocket.OPEN) {
+                  targetRec.ws.send(JSON.stringify(msg));
                 } else {
-                  console.warn('[WebSocket] target not open for', to, 'state=', target.readyState);
+                  console.warn('[WebSocket] target not open for', to, 'state=', targetRec.ws.readyState);
                 }
               } catch (err) {
                 console.error('[WebSocket] failed forwarding', type, 'to', to, err);
@@ -514,13 +885,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
               // notify others
               console.log('[WebSocket] player left', pid);
               for (const id of Array.from(clients.keys())) {
-                const cws = clients.get(id)!;
+                const crec = clients.get(id)!.ws;
                 try {
-                  cws.send(JSON.stringify({ type: 'peer-left', playerId: pid }));
+                  crec.send(JSON.stringify({ type: 'peer-left', playerId: pid }));
                 } catch (err) {
                   console.warn('[WebSocket] failed to notify peer-left to', id, err);
                 }
               }
+              (global as any).__wsHealth.connected = clients.size;
+              (global as any).__wsHealth.peers = Array.from(clients.keys()).map(id => ({ id, lastSeen: clients.get(id)!.lastSeen }));
             }
           }
         } catch (err) {
@@ -532,12 +905,45 @@ export async function registerRoutes(app: Express): Promise<Server> {
         if (registeredId && clients.has(registeredId)) {
           clients.delete(registeredId);
           for (const id of Array.from(clients.keys())) {
-            const cws = clients.get(id)!;
+            const cws = clients.get(id)!.ws;
             try { cws.send(JSON.stringify({ type: 'peer-left', playerId: registeredId })); } catch (err) {}
           }
+          (global as any).__wsHealth.connected = clients.size;
+          (global as any).__wsHealth.peers = Array.from(clients.keys()).map(id => ({ id, lastSeen: clients.get(id)!.lastSeen }));
         }
       });
     });
+
+    // Heartbeat interval: send pings and clean up stale peers
+    setInterval(() => {
+      try {
+        const now = Date.now();
+        for (const [id, rec] of Array.from(clients.entries())) {
+          try {
+            // attempt ping
+            if (rec.ws.readyState === WebSocket.OPEN) {
+              rec.ws.ping();
+            }
+          } catch (e) {}
+
+          const age = now - rec.lastSeen;
+          if (age > WS_STALE_MS) {
+            console.warn('[WebSocket] stale connection, terminating', id, 'ageMs=', age);
+            try { rec.ws.terminate(); } catch (e) {}
+            clients.delete(id);
+            // notify remaining peers
+            for (const pid of Array.from(clients.keys())) {
+              const cws = clients.get(pid)!.ws;
+              try { cws.send(JSON.stringify({ type: 'peer-left', playerId: id })); } catch (e) {}
+            }
+          }
+        }
+        (global as any).__wsHealth.connected = clients.size;
+        (global as any).__wsHealth.peers = Array.from(clients.keys()).map(id => ({ id, lastSeen: clients.get(id)!.lastSeen }));
+      } catch (e) {
+        // ignore heartbeat errors
+      }
+    }, WS_HEARTBEAT_INTERVAL);
   } catch (err) {
     console.error('[WebSocket] failed to start signaling server', err);
   }

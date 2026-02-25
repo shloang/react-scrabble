@@ -1,0 +1,126 @@
+{
+  "version": "1.0",
+  "generated_at": "2026-02-18T00:00:00Z",
+  "todos": [
+    {
+      "id": "voice-lobby-server-validation",
+      "feature": "Enable voice in lobby",
+      "area": "server",
+      "title": "Server: validate lobby voice",
+      "description": "Add server-side validation for lobby voice session creation, user auth, rate limits, and safe-room checks.",
+      "labels": ["voice", "server", "validation"],
+      "estimate_hours": 4,
+      "status": "open"
+    },
+    {
+      "id": "voice-lobby-client-ui",
+      "feature": "Enable voice in lobby",
+      "area": "client",
+      "title": "Client: lobby voice UI",
+      "description": "Add lobby UI controls to start/stop voice, show connection state, mic mute, and participant list.",
+      "labels": ["voice", "client", "ui"],
+      "estimate_hours": 6,
+      "status": "open"
+    },
+    {
+      "id": "voice-lobby-tests",
+      "feature": "Enable voice in lobby",
+      "area": "tests",
+      "title": "Tests: voice lobby integration",
+      "description": "Add unit and integration tests for voice signaling, reconnection, permission errors, and UI state transitions.",
+      "labels": ["voice", "tests", "integration"],
+      "estimate_hours": 5,
+      "status": "open"
+    },
+    {
+      "id": "voice-lobby-polish",
+      "feature": "Enable voice in lobby",
+      "area": "polish",
+      "title": "Voice UX polish",
+      "description": "Polish UX (icons, toasts), accessibility (aria labels), and performance (lazy init) for lobby voice.",
+      "labels": ["voice", "ux", "polish"],
+      "estimate_hours": 3,
+      "status": "open"
+    },
+    {
+      "id": "avatar-lobby-server-validation",
+      "feature": "Avatar display in lobby",
+      "area": "server",
+      "title": "Server: validate avatar URLs",
+      "description": "Validate avatar uploads/URLs, sanitize inputs, enforce size and content rules, and provide fallback avatar data.",
+      "labels": ["avatar", "server", "validation"],
+      "estimate_hours": 3,
+      "status": "open"
+    },
+    {
+      "id": "avatar-lobby-client-ui",
+      "feature": "Avatar display in lobby",
+      "area": "client",
+      "title": "Client: show avatars in lobby",
+      "description": "Display player avatars in lobby, add upload/change flow, and provide graceful fallbacks for missing avatars.",
+      "labels": ["avatar", "client", "ui"],
+      "estimate_hours": 5,
+      "status": "open"
+    },
+    {
+      "id": "avatar-lobby-tests",
+      "feature": "Avatar display in lobby",
+      "area": "tests",
+      "title": "Tests: avatar flows",
+      "description": "Add tests for avatar display, fallback behaviour, upload validation, and URL-safety checks.",
+      "labels": ["avatar", "tests"],
+      "estimate_hours": 4,
+      "status": "open"
+    },
+    {
+      "id": "avatar-lobby-polish",
+      "feature": "Avatar display in lobby",
+      "area": "polish",
+      "title": "Avatar styling polish",
+      "description": "Polish avatar sizes, caching, placeholder animations, and responsive layout in the lobby.",
+      "labels": ["avatar", "ux", "polish"],
+      "estimate_hours": 2,
+      "status": "open"
+    },
+    {
+      "id": "cached-stats-server-validation",
+      "feature": "Surface cached player stats",
+      "area": "server",
+      "title": "Server: expose cached stats",
+      "description": "Add/validate API for returning cached player stats, enforce freshness rules, and ensure auth/permissions.",
+      "labels": ["stats", "server", "cache"],
+      "estimate_hours": 3,
+      "status": "open"
+    },
+    {
+      "id": "cached-stats-client-ui",
+      "feature": "Surface cached player stats",
+      "area": "client",
+      "title": "Client: show cached stats",
+      "description": "Display cached player stats in lobby player cards with visual indicators for staleness and loading state.",
+      "labels": ["stats", "client", "ui", "cache"],
+      "estimate_hours": 5,
+      "status": "open"
+    },
+    {
+      "id": "cached-stats-tests",
+      "feature": "Surface cached player stats",
+      "area": "tests",
+      "title": "Tests: cached stats",
+      "description": "Add tests for cached stats endpoints, staleness handling, client display, and error scenarios.",
+      "labels": ["stats", "tests", "cache"],
+      "estimate_hours": 4,
+      "status": "open"
+    },
+    {
+      "id": "cached-stats-polish",
+      "feature": "Surface cached player stats",
+      "area": "polish",
+      "title": "Stats UX polish",
+      "description": "Polish stats formatting, tooltips, telemetry for cache hits/misses, and fallback behaviors.",
+      "labels": ["stats", "ux", "polish"],
+      "estimate_hours": 2,
+      "status": "open"
+    }
+  ]
+}

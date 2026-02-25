@@ -13,7 +13,9 @@ type SignalMsg = any;
 
 export default function VoiceChat({ playerId, voiceVolume = 1, playerNames, onStateUpdate, externalPeerMuted = null, externalPeerVolumes = null }: VoiceChatProps) {
   const wsRef = useRef<WebSocket | null>(null);
+  const [wsState, setWsState] = useState<'connecting' | 'open' | 'closed' | 'error' | 'none'>('none');
   const pcRefs = useRef<Record<string, RTCPeerConnection>>({});
+  const iceServersRef = useRef<any[] | null>(null);
   const audioEls = useRef<Record<string, HTMLAudioElement>>({});
   const localStreamRef = useRef<MediaStream | null>(null);
   const [micEnabled, setMicEnabled] = useState(false);
@@ -31,146 +33,113 @@ export default function VoiceChat({ playerId, voiceVolume = 1, playerNames, onSt
   useEffect(() => {
     if (!playerId) return;
 
-    // Try a few ways to construct a safe websocket URL. Some hosting/proxies
-    // (Replit dev URLs) may include query tokens or rewrite hosts — be defensive.
-    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    let ws: WebSocket | null = null;
-    const tryCreate = (url: string) => {
-      try {
-        console.log('[VoiceChat] attempting websocket to', url);
-        return new WebSocket(url);
-      } catch (e) {
-        console.warn('[VoiceChat] websocket creation failed for', url, e);
-        return null;
+    let cleanupCurrent: (() => void) | null = null;
+
+    const setup = () => {
+      // cleanup any previous
+      try { if (cleanupCurrent) { cleanupCurrent(); cleanupCurrent = null; } } catch (e) {}
+
+      // Try to construct a safe websocket URL. Use the URL API and origin
+      // fallbacks so hosting rewrites or query tokens don't corrupt the host.
+      const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      let ws: WebSocket | null = null;
+      const tryCreate = (url: string) => {
+        try {
+          console.log('[VoiceChat] attempting websocket to', url);
+          return new WebSocket(url);
+        } catch (e) {
+          console.warn('[VoiceChat] websocket creation failed for', url, e);
+          return null;
+        }
+      };
+
+      const candidates: string[] = [];
+      try { const u = new URL(window.location.href); if (u.origin) candidates.push(u.origin); } catch (e) {}
+      if (typeof window !== 'undefined' && (window as any).location && (window as any).location.origin) candidates.push((window as any).location.origin);
+      try { const hostOnly = window.location.hostname + (window.location.port ? `:${window.location.port}` : ''); candidates.push(`${window.location.protocol.includes('https') ? 'https' : 'http'}://${hostOnly}`); } catch (e) {}
+
+      for (const base of candidates) {
+        try {
+          const u = new URL(base);
+          u.protocol = protocol + ':';
+          u.pathname = '/ws';
+          u.search = '';
+          u.hash = '';
+          ws = tryCreate(u.toString());
+          if (ws) break;
+        } catch (e) {}
       }
+
+      if (!ws) {
+        console.error('[VoiceChat] failed to create websocket connection - no valid URL');
+        setWsState('error');
+        return;
+      }
+
+      wsRef.current = ws;
+      setWsState('connecting');
+
+      const onOpen = () => { console.log('[VoiceChat] ws open'); setWsState('open'); try { ws!.send(JSON.stringify({ type: 'join', playerId })); } catch (e) {} };
+      const onError = (ev: any) => { console.error('[VoiceChat] ws error', ev); setWsState('error'); };
+      const onClose = () => { console.log('[VoiceChat] ws closed'); setWsState('closed'); };
+      const onMessage = async (ev: MessageEvent) => {
+        try { console.log('[VoiceChat] ws message', ev.data); } catch (err) {}
+        try {
+          const msg: SignalMsg = JSON.parse(ev.data as string);
+          const type = msg.type;
+          if (type === 'peers') {
+            const list: string[] = Array.isArray(msg.peers) ? msg.peers : [];
+            setPeers(list);
+            setPeerStatuses(prev => { const next = { ...prev }; for (const id of list) if (next[id] === undefined) next[id] = 'new'; return next; });
+            setPeerVolumes(prev => { const next = { ...prev }; for (const id of list) if (next[id] === undefined) next[id] = 1; return next; });
+            setPeerMuted(prev => { const next = { ...prev }; for (const id of list) if (next[id] === undefined) next[id] = false; return next; });
+            for (const peerId of list) { if (peerId === playerId) continue; console.log('[VoiceChat] creating offer ->', peerId); await createOffer(peerId); }
+          } else if (type === 'new-peer') {
+            const newId = String(msg.playerId);
+            setPeers(prev => prev.includes(newId) ? prev : [...prev, newId]);
+            setPeerStatuses(prev => ({ ...prev, [newId]: prev[newId] ?? 'new' }));
+            setPeerVolumes(prev => ({ ...prev, [newId]: prev[newId] ?? 1 }));
+            setPeerMuted(prev => ({ ...prev, [newId]: prev[newId] ?? false }));
+            console.log('[VoiceChat] received new-peer (will wait for offer) ->', newId);
+          } else if (type === 'offer') { const from = String(msg.from); console.log('[VoiceChat] received offer from', from); await handleOffer(from, msg.sdp); }
+          else if (type === 'answer') { const from = String(msg.from); console.log('[VoiceChat] received answer from', from); await handleAnswer(from, msg.sdp); }
+          else if (type === 'candidate') { const from = String(msg.from); console.log('[VoiceChat] received candidate from', from, msg.candidate ? '[candidate]' : 'no-candidate'); await handleCandidate(from, msg.candidate); }
+          else if (type === 'peer-left') { const pid = String(msg.playerId); cleanupPeer(pid); setPeers(prev => prev.filter(p => p !== pid)); }
+        } catch (err) { /* ignore */ }
+      };
+
+      ws.addEventListener('open', onOpen);
+      ws.addEventListener('error', onError);
+      ws.addEventListener('close', onClose);
+      ws.addEventListener('message', onMessage as any);
+
+      cleanupCurrent = () => {
+        try { ws.send(JSON.stringify({ type: 'leave', playerId })); } catch (err) {}
+        try { ws.close(); } catch (err) {}
+        ws.removeEventListener('open', onOpen);
+        ws.removeEventListener('error', onError);
+        ws.removeEventListener('close', onClose);
+        ws.removeEventListener('message', onMessage as any);
+        for (const pid of Object.keys(pcRefs.current)) cleanupPeer(pid);
+        try { if (rafRef.current) cancelAnimationFrame(rafRef.current); rafRef.current = null; } catch (err) {}
+        try { for (const k of Object.keys(analysersRef.current)) { try { analysersRef.current[k].disconnect(); } catch (err) {} delete analysersRef.current[k]; } if (audioCtxRef.current) { try { audioCtxRef.current.close(); } catch (err) {} audioCtxRef.current = null; } } catch (err) {}
+        wsRef.current = null;
+      };
     };
 
-    // Preferred: same host + /ws
-    const hostUrl = `${protocol}://${window.location.host}/ws`;
-    ws = tryCreate(hostUrl);
-    // Fallback: use hostname+port explicitly (avoids including query string)
-    if (!ws) {
-      const hostOnly = window.location.hostname + (window.location.port ? `:${window.location.port}` : '');
-      ws = tryCreate(`${protocol}://${hostOnly}/ws`);
-    }
-    // Last resort: build from full URL but strip query/search
-    if (!ws) {
-      try {
-        const u = new URL(window.location.href);
-        u.protocol = protocol + ':';
-        u.search = '';
-        u.hash = '';
-        u.pathname = '/ws';
-        ws = tryCreate(u.toString());
-      } catch (e) {
-        console.warn('[VoiceChat] fallback URL build failed', e);
-      }
-    }
+    // initial setup
+    setup();
 
-    if (!ws) {
-      console.error('[VoiceChat] failed to create websocket connection - no valid URL');
-      return;
-    }
-    wsRef.current = ws;
-
-    ws.addEventListener('open', () => {
-      console.log('[VoiceChat] ws open');
-      ws.send(JSON.stringify({ type: 'join', playerId }));
-    });
-
-    ws.addEventListener('error', (ev) => {
-      console.error('[VoiceChat] ws error', ev);
-    });
-
-    ws.addEventListener('message', async (ev) => {
-      // console log raw message for diagnosis
-      try { console.log('[VoiceChat] ws message', ev.data); } catch (err) {}
-      try {
-        const msg: SignalMsg = JSON.parse(ev.data);
-        const type = msg.type;
-        if (type === 'peers') {
-          const list: string[] = Array.isArray(msg.peers) ? msg.peers : [];
-          setPeers(list);
-          setPeerStatuses(prev => {
-            const next = { ...prev };
-            for (const id of list) if (next[id] === undefined) next[id] = 'new';
-            return next;
-          });
-          // initialize per-peer controls defaults for new peers
-          setPeerVolumes(prev => {
-            const next = { ...prev };
-            for (const id of list) if (next[id] === undefined) next[id] = 1;
-            return next;
-          });
-          setPeerMuted(prev => {
-            const next = { ...prev };
-            for (const id of list) if (next[id] === undefined) next[id] = false;
-            return next;
-          });
-            // create offers to existing peers
-          for (const peerId of list) {
-            if (peerId === playerId) continue;
-            console.log('[VoiceChat] creating offer ->', peerId);
-            await createOffer(peerId);
-          }
-        } else if (type === 'new-peer') {
-          const newId = String(msg.playerId);
-          // existing client: add peer but DO NOT create an offer (joining client will)
-          setPeers(prev => prev.includes(newId) ? prev : [...prev, newId]);
-          setPeerStatuses(prev => ({ ...prev, [newId]: prev[newId] ?? 'new' }));
-          setPeerVolumes(prev => ({ ...prev, [newId]: prev[newId] ?? 1 }));
-          setPeerMuted(prev => ({ ...prev, [newId]: prev[newId] ?? false }));
-          console.log('[VoiceChat] received new-peer (will wait for offer) ->', newId);
-        } else if (type === 'offer') {
-          const from = String(msg.from);
-          console.log('[VoiceChat] received offer from', from);
-          await handleOffer(from, msg.sdp);
-        } else if (type === 'answer') {
-          const from = String(msg.from);
-          console.log('[VoiceChat] received answer from', from);
-          await handleAnswer(from, msg.sdp);
-        } else if (type === 'candidate') {
-          const from = String(msg.from);
-          console.log('[VoiceChat] received candidate from', from, msg.candidate ? '[candidate]' : 'no-candidate');
-          await handleCandidate(from, msg.candidate);
-        } else if (type === 'peer-left') {
-          const pid = String(msg.playerId);
-          cleanupPeer(pid);
-          setPeers(prev => prev.filter(p => p !== pid));
-        }
-      } catch (err) {
-        // ignore
-      }
-    });
-
-    ws.addEventListener('close', () => {
-      // cleanup
-      for (const pid of Object.keys(pcRefs.current)) {
-        cleanupPeer(pid);
-      }
-      wsRef.current = null;
-    });
+    // allow UI to request reconnect by dispatching a custom event
+    const onReconnect = () => {
+      try { if (cleanupCurrent) { cleanupCurrent(); cleanupCurrent = null; } } catch (e) {}
+      setup();
+    };
+    window.addEventListener('voicechat:reconnect', onReconnect);
 
     return () => {
-      try { ws.send(JSON.stringify({ type: 'leave', playerId })); } catch (err) {}
-      try { ws.close(); } catch (err) {}
-      for (const pid of Object.keys(pcRefs.current)) cleanupPeer(pid);
-      // stop RAF and disconnect analysers
-      try {
-        if (rafRef.current) cancelAnimationFrame(rafRef.current);
-        rafRef.current = null;
-      } catch (err) {}
-      try {
-        for (const k of Object.keys(analysersRef.current)) {
-          try { analysersRef.current[k].disconnect(); } catch (err) {}
-          delete analysersRef.current[k];
-        }
-        if (audioCtxRef.current) {
-          try { audioCtxRef.current.close(); } catch (err) {}
-          audioCtxRef.current = null;
-        }
-      } catch (err) {}
-      wsRef.current = null;
+      try { if (cleanupCurrent) cleanupCurrent(); } catch (e) {}
+      window.removeEventListener('voicechat:reconnect', onReconnect);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playerId]);
@@ -225,7 +194,21 @@ export default function VoiceChat({ playerId, voiceVolume = 1, playerNames, onSt
 
   async function createPeerConnection(remoteId: string) {
     if (pcRefs.current[remoteId]) return pcRefs.current[remoteId];
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    // Ensure we have iceServers (fetch from server once)
+    try {
+      if (!iceServersRef.current) {
+        const resp = await fetch('/api/turn-config');
+        if (resp.ok) {
+          const data = await resp.json();
+          if (Array.isArray(data?.iceServers) && data.iceServers.length > 0) iceServersRef.current = data.iceServers;
+        }
+      }
+    } catch (err) {
+      console.warn('[VoiceChat] failed to fetch turn-config, using default STUN', err);
+    }
+
+    const servers = iceServersRef.current ?? [{ urls: 'stun:stun.l.google.com:19302' }];
+    const pc = new RTCPeerConnection({ iceServers: servers });
     pcRefs.current[remoteId] = pc;
 
     // connection state tracking
@@ -529,7 +512,7 @@ export default function VoiceChat({ playerId, voiceVolume = 1, playerNames, onSt
     return () => { cancelled = true; if (rafRef.current) cancelAnimationFrame(rafRef.current); rafRef.current = null; };
   }, []);
 
-  return (
+    return (
     <div className="voice-chat">
       <div className="flex items-center gap-2">
         <button
@@ -539,6 +522,18 @@ export default function VoiceChat({ playerId, voiceVolume = 1, playerNames, onSt
           {micEnabled ? 'Disable Mic' : 'Enable Mic'}
         </button>
         <div className="text-sm text-muted-foreground">Peers: {peers.length}</div>
+        <div className="text-xs px-2 py-1 rounded ml-2 flex items-center gap-2" aria-hidden>
+          {wsState === 'open' ? <span className="text-green-500">● connected</span> : wsState === 'connecting' ? <span className="text-yellow-500">● connecting</span> : wsState === 'error' ? <span className="text-red-500">● error</span> : <span className="text-gray-400">● idle</span>}
+          {(wsState === 'error' || wsState === 'closed') && (
+            <button
+              onClick={() => window.dispatchEvent(new Event('voicechat:reconnect'))}
+              className="text-xs px-2 py-1 rounded bg-muted/10 hover:bg-muted/20"
+              title="Reconnect signaling"
+            >
+              Reconnect
+            </button>
+          )}
+        </div>
       </div>
       {/* Per-peer UI is shown inline on each PlayerCard; keep this component compact */}
     </div>

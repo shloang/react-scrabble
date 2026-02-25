@@ -32,6 +32,21 @@ export async function joinGame(playerName: string, password: string): Promise<{ 
   return response.json();
 }
 
+export async function leaveGame(playerId: string): Promise<{ success: boolean; gameState?: GameState | null }> {
+  const response = await fetch('/api/game/leave', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ playerId })
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err?.error || 'Failed to leave game');
+  }
+
+  return response.json();
+}
+
 export type UpdateResponse = { success: boolean; gameState?: GameState };
 
 export async function updateGameState(gameState: GameState): Promise<UpdateResponse> {

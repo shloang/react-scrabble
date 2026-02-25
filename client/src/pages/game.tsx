@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { MOVE_TIME, Player, PlacedTile, GameState, TILE_VALUES } from '@shared/schema';
-import { getGameState, joinGame as joinGameApi, updateGameState, validateWord, sendPreview } from '@/lib/gameApi';
+import { getGameState, joinGame as joinGameApi, updateGameState, validateWord, sendPreview, initializeGame } from '@/lib/gameApi';
+import { ensureWordListLoaded, isWordLocal } from '@/lib/wordLocal';
 import { extractWordsFromBoard, calculateScore, validatePlacement } from '@/lib/gameLogic';
 import GameBoard from '@/components/GameBoard';
 import PlayerCard from '@/components/PlayerCard';
@@ -16,10 +17,16 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { CheckCircle, SkipForward, Sun, Moon } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
+import { useLocation } from 'wouter';
+import { getStats, incrementWin, incrementLoss, getAllStats } from '@/lib/playerStats';
 
 export default function Game() {
-  const [playerId, setPlayerId] = useState<string | null>(null);
-  const [isJoining, setIsJoining] = useState(true);
+  const [playerId, setPlayerId] = useState<string | null>(() => {
+    try { return localStorage.getItem('playerId'); } catch { return null; }
+  });
+  const [isJoining, setIsJoining] = useState<boolean>(() => {
+    try { return !localStorage.getItem('playerId'); } catch { return true; }
+  });
   const [selectedTileIndex, setSelectedTileIndex] = useState<number | null>(null);
   const [discardMode, setDiscardMode] = useState(false);
   const [selectedDiscardIndices, setSelectedDiscardIndices] = useState<number[]>([]);
@@ -56,6 +63,8 @@ export default function Game() {
   const [showEndScreenMinimized, setShowEndScreenMinimized] = useState<boolean>(() => {
     try { return localStorage.getItem('endScreenMinimized') === '1'; } catch { return false; }
   });
+  const [, setLocation] = useLocation();
+  const statsUpdatedRef = useRef<boolean>(false);
   const lastTurnStartRef = useRef<number | null>(null);
 
   // Sync dark mode state to document and localStorage
@@ -147,6 +156,7 @@ export default function Game() {
       }
       setJoinError(null);
       setIsJoining(false);
+      // do not navigate away after join; keep user on the Game page
       setTimeLeft(MOVE_TIME);
       refetch();
     },
@@ -417,7 +427,19 @@ export default function Game() {
       let cancelled = false;
       (async () => {
         try {
-          const results = await Promise.all(words.map(w => validateWord(w.word.toLowerCase()).then(r => !!r.isValid).catch(() => false)));
+          await ensureWordListLoaded();
+          const results = await Promise.all(words.map(async (w) => {
+            const lw = w.word.toLowerCase();
+            const local = isWordLocal(lw);
+            if (local !== null) return local;
+            try {
+              const r = await validateWord(lw);
+              return !!r.isValid;
+            } catch {
+              return false;
+            }
+          }));
+
           if (cancelled) return;
           const statuses = words.map((w, i) => ({ word: w.word, positions: w.positions, status: results[i] ? 'valid' : 'invalid' }));
           setPlacedWordStatuses(statuses as any);
@@ -460,7 +482,7 @@ export default function Game() {
   // Play win/lose sound when game ends
   useEffect(() => {
     if (!gameState || !playerId || !gameState.gameEnded || hasPlayedEndGameSound) return;
-    
+
     const isWinner = gameState.winnerId === playerId;
     if (isWinner) {
       playSound('win.mp3');
@@ -468,14 +490,34 @@ export default function Game() {
       playSound('lose.mp3');
     }
     setHasPlayedEndGameSound(true);
+
+    // Update local player stats once per finished game
+    try {
+      if (!statsUpdatedRef.current) {
+        const winnerId = gameState.winnerId;
+        if (winnerId) incrementWin(winnerId);
+        for (const p of gameState.players) {
+          if (p.id !== winnerId) incrementLoss(p.id);
+        }
+        statsUpdatedRef.current = true;
+      }
+    } catch (err) {
+      // ignore stats update errors
+    }
   }, [gameState?.gameEnded, gameState?.winnerId, playerId, hasPlayedEndGameSound]);
 
   // Show end-screen overlay when game ends; allow local dismissal
   useEffect(() => {
     if (!gameState) return;
     if (gameState.gameEnded) setShowEndScreen(true);
-    else setShowEndScreen(false);
+    else {
+      setShowEndScreen(false);
+      // reset per-game stats update marker so next end will update stats again
+      statsUpdatedRef.current = false;
+    }
   }, [gameState?.gameEnded]);
+
+  // Background auto-start removed: host should explicitly start from the Lobby page.
 
   // Persist and handle minimize state for the end-screen overlay.
   useEffect(() => {
@@ -500,31 +542,53 @@ export default function Game() {
   useEffect(() => {
     if (!gameState) return;
     const moves = gameState.moves || [];
-    if (moves.length > 0) {
-      // The last move's timestamp marks the start of the current turn
+    // Prefer server-authoritative turnStart when available
+    if (typeof gameState.turnStart === 'number' && gameState.turnStart) {
+      lastTurnStartRef.current = gameState.turnStart;
+    } else if (moves.length > 0) {
+      // Fallback: use last move timestamp
       const last = moves[moves.length - 1];
       lastTurnStartRef.current = last.timestamp;
     } else {
-      // No moves yet: if we haven't set a turn start, initialize to now
+      // No moves yet: initialize to now if not set
       if (!lastTurnStartRef.current) lastTurnStartRef.current = Date.now();
     }
-  }, [gameState?.moves?.length, gameState?.currentPlayer]);
+  }, [gameState?.moves?.length, gameState?.currentPlayer, gameState?.turnStart]);
 
   // Continuous timer for everyone: compute remaining time by comparing now to the
   // last-turn start timestamp (derived from the last move). This keeps the visible
   // countdown running for all players, not only the local player.
   useEffect(() => {
     if (!gameState) return;
-    let cancelled = false;
+    // If the game ended, show 0
+    if (gameState.gameEnded) {
+      setTimeLeft(0);
+      return;
+    }
 
+    // Compute remaining based on server `turnStart` and `pausedAt` when paused
+    const computeRemainingAt = (nowMs: number) => {
+      const startMs = (typeof gameState.turnStart === 'number' && gameState.turnStart) ? gameState.turnStart : (lastTurnStartRef.current ?? nowMs);
+      // if paused, use pausedAt as the reference moment to compute elapsed
+      const refMs = (gameState.paused && typeof gameState.pausedAt === 'number' && gameState.pausedAt) ? gameState.pausedAt : nowMs;
+      const elapsed = Math.floor((refMs - startMs) / 1000);
+      return Math.max(0, MOVE_TIME - elapsed);
+    };
+
+    // If paused, set a static remaining and don't start ticking
+    if (gameState.paused) {
+      const remaining = computeRemainingAt(Date.now());
+      setTimeLeft(remaining);
+      return;
+    }
+
+    let cancelled = false;
     const tick = () => {
       if (cancelled) return;
-      const startMs = lastTurnStartRef.current ?? Date.now();
-      const elapsed = Math.floor((Date.now() - startMs) / 1000);
-      const remaining = Math.max(0, MOVE_TIME - elapsed);
+      const now = Date.now();
+      const remaining = computeRemainingAt(now);
 
       setTimeLeft(prev => {
-        // Play 20-second warning only for the player whose turn it is locally
         if (gameState.currentPlayer === playerId) {
           if (remaining <= 20 && !hasPlayed20SecSound) {
             playSound('20sec.mp3');
@@ -534,20 +598,18 @@ export default function Game() {
         return remaining;
       });
 
-      // If time ran out for the current player and this client is the active player,
-      // trigger skip. We only call handleSkipTurn when it's this client's turn to avoid
-      // duplicated actions from multiple clients; server should be authoritative.
       if (remaining <= 0 && gameState.currentPlayer === playerId) {
         handleSkipTurn();
-        // reset turn start for the next tick (server will also update moves)
-        lastTurnStartRef.current = Date.now();
+        // don't manipulate lastTurnStartRef — server will provide authoritative state
       }
     };
 
     tick();
     const id = setInterval(tick, 1000);
     return () => { cancelled = true; clearInterval(id); };
-  }, [gameState, playerId, hasPlayed20SecSound]);
+  }, [gameState?.gameEnded, gameState?.paused, gameState?.pausedAt, gameState?.turnStart, gameState?.currentPlayer, playerId, hasPlayed20SecSound]);
+
+  // Note: server now manages `pausedAt` and `turnStart`; client relies on those fields.
 
   // Keyboard shortcut: press 'E' to toggle the end-screen when a game has ended
   useEffect(() => {
@@ -589,48 +651,22 @@ export default function Game() {
     setIsCheckingWord(true);
     setWordCheckResult(null);
     try {
-      const res = await validateWord(w.toLowerCase());
-      setWordCheckResult({ word: w, valid: res.isValid, extract: res.extract || null });
-      if (res.isValid) {
-        toast({ title: 'Слово найдено', description: `${w} — валидно` });
+      await ensureWordListLoaded();
+      const local = isWordLocal(w.toLowerCase());
+      if (local !== null) {
+        setWordCheckResult({ word: w, valid: local, extract: null });
       } else {
-        toast({ variant: 'destructive', title: 'Слово не найдено', description: `${w} — невалидно` });
+        const res = await validateWord(w.toLowerCase());
+        setWordCheckResult({ word: w, valid: res.isValid, extract: res.extract || null });
       }
     } catch (err) {
-      toast({ variant: 'destructive', title: 'Ошибка проверки', description: 'Не удалось проверить слово' });
+      setWordCheckResult({ word: w, valid: false, extract: null });
     } finally {
       setIsCheckingWord(false);
     }
   };
 
-  // Auto-restore session from localStorage if possible
-  useEffect(() => {
-    (async () => {
-      try {
-        const savedId = localStorage.getItem('playerId');
-        const savedName = localStorage.getItem('playerName');
-        if (!savedId) return;
-
-        // validate savedId against server game state before auto-restoring
-        try {
-          const state = await getGameState();
-          if (state && Array.isArray(state.players) && state.players.some(p => p.id === savedId)) {
-            setPlayerId(savedId);
-            setIsJoining(false);
-            try { refetch(); } catch {}
-            return;
-          }
-        } catch (err) {
-          // if fetching state failed, don't auto-restore
-        }
-
-        // saved id not valid -> clear persisted session
-        try { localStorage.removeItem('playerId'); localStorage.removeItem('playerName'); } catch {}
-      } catch (err) {
-        // ignore restore errors
-      }
-    })();
-  }, []);
+  // Session routing/validation is owned by App-level guard.
   useEffect(() => {
     const onKeyDown = async (e: KeyboardEvent) => {
       // Ctrl+Enter (or Cmd+Enter) submits move when it's your turn
@@ -1005,6 +1041,10 @@ export default function Game() {
 
   const handleRecall = async () => {
     if (!gameState || placedTiles.length === 0) return;
+    if (gameState.paused) {
+      toast({ variant: 'destructive', title: 'Игра приостановлена', description: 'Нельзя изменять состояние во время паузы' });
+      return;
+    }
     const currentPlayer = getCurrentPlayer();
     if (!currentPlayer) return;
 
@@ -1048,6 +1088,10 @@ export default function Game() {
 
   const handleSubmitMove = async () => {
     if (!gameState || gameState.currentPlayer !== playerId || placedTiles.length === 0) return;
+    if (gameState.paused) {
+      toast({ variant: 'destructive', title: 'Игра приостановлена', description: 'Нельзя сделать ход во время паузы' });
+      return;
+    }
     const pid = playerId;
     if (!pid) return;
 
@@ -1187,6 +1231,10 @@ export default function Game() {
 
   const handleSkipTurn = async () => {
     if (!gameState || gameState.currentPlayer !== playerId) return;
+    if (gameState.paused) {
+      toast({ variant: 'destructive', title: 'Игра приостановлена', description: 'Нельзя пропустить ход во время паузы' });
+      return;
+    }
     const pid = playerId;
     if (!pid) return;
 
@@ -1245,6 +1293,10 @@ export default function Game() {
     }
 
     if (!gameState || gameState.currentPlayer !== playerId) return;
+    if (gameState.paused) {
+      toast({ variant: 'destructive', title: 'Игра приостановлена', description: 'Нельзя обменивать плитки во время паузы' });
+      return;
+    }
     const pid = playerId;
     if (!pid) return;
     const currentPlayer = getCurrentPlayer();
@@ -1318,10 +1370,45 @@ export default function Game() {
     }
   };
 
+  // Pause / Resume game handler
+  const handleTogglePause = async () => {
+    if (!playerId || !gameState) return;
+    try {
+      const fresh = await getGameState();
+      const newState = structuredClone(fresh || gameState) as GameState;
+      const wasPaused = !!newState.paused;
+      // Toggle pause and set server-side pausedAt timestamp when pausing.
+      newState.paused = !wasPaused;
+      newState.pausedBy = newState.paused ? playerId : null;
+      if (newState.paused) {
+        newState.pausedAt = Date.now();
+      } else {
+        // server will adjust turnStart when processing resume; clear pausedAt
+        newState.pausedAt = null;
+      }
+
+      await updateMutation.mutateAsync(newState);
+      toast({ title: newState.paused ? 'Игра приостановлена' : 'Игра возобновлена' });
+    } catch (err) {
+      toast({ variant: 'destructive', title: 'Ошибка', description: 'Не удалось изменить состояние паузы' });
+      console.error('[Pause] failed', err);
+    }
+  };
+
+  const handleBackToLobby = async () => {
+    try { setLocation('/lobby'); } catch {}
+    toast({ title: 'Вы вернулись в лобби' });
+  };
+
   const isCurrentPlayer = gameState?.currentPlayer === playerId;
 
   return (
     <div className="min-h-screen bg-background">
+      {gameState?.paused && (
+        <div className="fixed top-0 left-0 right-0 bg-yellow-100 border-b border-yellow-300 text-yellow-900 p-3 z-40 flex items-center justify-center">
+          <div className="text-sm font-medium">Приостановлено {gameState.pausedBy ? `пользователем ${ (gameState.players || []).find(p => p.id === gameState.pausedBy)?.name ?? '' }` : ''}</div>
+        </div>
+      )}
       <JoinGameDialog
         open={isJoining}
         playerCount={gameState?.players.length || 0}
@@ -1347,8 +1434,15 @@ export default function Game() {
                 setShowEndScreenMinimized(true);
               }}
               onNewGame={() => {
-                // Reset game - could add API call here
-                window.location.reload();
+                // Navigate back to lobby page
+                try { setLocation('/lobby'); } catch {}
+                setShowEndScreen(false);
+                setShowEndScreenMinimized(false);
+                setHasPlayedEndGameSound(false);
+                setTimeLeft(MOVE_TIME);
+                lastTurnStartRef.current = Date.now();
+                try { refetch(); } catch {}
+                toast({ title: 'Возврат в лобби' });
               }}
             />
           )}
@@ -1367,6 +1461,9 @@ export default function Game() {
 
           {/* keyboard shortcut to toggle the end screen when the game has ended */}
           {/** NOTE: attaches on mount/unmount below via effect */}
+
+          {/* Lobby moved to a separate page at /lobby */}
+
           <div className="h-screen flex flex-col lg:flex-row gap-4 p-4">
           <aside className="lg:w-72 flex flex-col gap-4">
             <h1 className="text-2xl font-bold">Игроки</h1>
@@ -1419,6 +1516,24 @@ export default function Game() {
                     />
                     <div className="text-xs w-8 text-right">{Math.round(voiceVolume * 100)}%</div>
                   </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleTogglePause}
+                    disabled={!!gameState?.gameEnded}
+                    className={`px-3 py-1 rounded hover:bg-muted/10 ${gameState?.paused ? 'bg-yellow-500 text-white' : 'bg-transparent'}`}
+                    aria-pressed={!!gameState?.paused}
+                    title={gameState?.paused ? `Resume (paused by ${gameState.pausedBy ?? 'someone'})` : 'Pause game'}
+                  >
+                    {gameState?.paused ? 'Resume' : 'Pause'}
+                  </button>
+                  <button
+                    onClick={handleBackToLobby}
+                    className="px-3 py-1 rounded border hover:bg-muted/10"
+                    title="Вернуться в лобби без выхода из текущей сессии"
+                  >
+                    В лобби
+                  </button>
                 </div>
               </div>
             </div>
@@ -1676,7 +1791,7 @@ export default function Game() {
                     />
                     <Button
                       onClick={handleCheckWord}
-                      disabled={isCheckingWord}
+                      disabled={isCheckingWord || !!gameState?.gameEnded}
                     >
                       {isCheckingWord ? 'Проверка...' : 'Проверить'}
                     </Button>
@@ -1720,16 +1835,15 @@ export default function Game() {
                   <h2 className="text-lg font-semibold mb-4">Ваши фишки</h2>
                   <TileRack
                     rack={rackView || clientRackState || getCurrentPlayer()?.rack || []}
-                      selectedTileIndex={selectedTileIndex}
-                      selectedIndices={discardMode ? selectedDiscardIndices : undefined}
+                    selectedTileIndex={selectedTileIndex}
+                    selectedIndices={discardMode ? selectedDiscardIndices : undefined}
                     onTileClick={handleTileClick}
                     onShuffle={handleShuffle}
                     onRecall={handleRecall}
                     onReorder={handleReorderRack}
                     onDropFromBoard={handleDropFromBoard}
-                    // Allow interaction during planning (when not your turn) so players can
-                    // drag tiles onto the board visually; server updates remain controlled.
-                    canInteract={!isJoining}
+                    // Disable interactions when the game has ended
+                    canInteract={!isJoining && !gameState?.gameEnded}
                   />
                 </div>
                   <div className="flex flex-col gap-2">
@@ -1738,7 +1852,7 @@ export default function Game() {
                         <Button
                           size="lg"
                           onClick={handleSubmitMove}
-                          disabled={placedTiles.length === 0 || isValidating}
+                          disabled={placedTiles.length === 0 || isValidating || !!gameState?.gameEnded}
                           className="w-full"
                           data-testid="button-submit"
                         >
@@ -1749,7 +1863,7 @@ export default function Game() {
                           variant="outline"
                           size="lg"
                           onClick={handleSkipTurn}
-                          disabled={isValidating}
+                          disabled={isValidating || !!gameState?.gameEnded}
                           className="w-full"
                           data-testid="button-skip"
                         >
@@ -1760,7 +1874,7 @@ export default function Game() {
                           variant="outline"
                           size="lg"
                           onClick={handleStartDiscard}
-                          disabled={isValidating || (gameState && gameState.tileBag.length === 0)}
+                          disabled={isValidating || !!gameState?.gameEnded || (gameState && gameState.tileBag.length === 0)}
                           className="w-full"
                           data-testid="button-swap"
                           title={gameState && gameState.tileBag.length === 0 ? 'Нельзя обменивать фишки: мешок пуст' : ''}
@@ -1772,20 +1886,20 @@ export default function Game() {
                       <>
                         <div className="text-sm text-muted-foreground">Выберите фишки для обмена</div>
                         <div className="flex gap-2">
-                          <Button
-                            size="lg"
-                            onClick={handleConfirmDiscard}
-                            disabled={selectedDiscardIndices.length === 0 || isValidating}
-                            className="flex-1"
-                            data-testid="button-confirm-swap"
-                          >
+                            <Button
+                              size="lg"
+                              onClick={handleConfirmDiscard}
+                              disabled={selectedDiscardIndices.length === 0 || isValidating || !!gameState?.gameEnded}
+                              className="flex-1"
+                              data-testid="button-confirm-swap"
+                            >
                             Подтвердить обмен
                           </Button>
                           <Button
                             variant="outline"
                             size="lg"
                             onClick={handleCancelDiscard}
-                            disabled={isValidating}
+                            disabled={isValidating || !!gameState?.gameEnded}
                             className="flex-1"
                             data-testid="button-cancel-swap"
                           >
