@@ -36,6 +36,13 @@ export default function VoiceChatMinimal({ playerId, voiceVolume = 1, playerName
     const setup = () => {
       try { if (cleanupCurrent) { cleanupCurrent(); cleanupCurrent = null; } } catch (e) {}
 
+      // Guard: do not open a WebSocket if there is no signaling token.
+      const signalingToken = getSignalingToken();
+      if (!signalingToken) {
+        console.warn('[VoiceChat] no signaling token present, skipping WebSocket connection');
+        return;
+      }
+
       const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
       let ws: WebSocket | null = null;
       const tryCreate = (url: string) => {

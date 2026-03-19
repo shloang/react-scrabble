@@ -71,6 +71,13 @@ export default function VoiceChat({
       // cleanup any previous
       try { if (cleanupCurrent) { cleanupCurrent(); cleanupCurrent = null; } } catch (e) {}
 
+      // Guard: do not open a WebSocket if there is no signaling token.
+      const signalingToken = getSignalingToken();
+      if (!signalingToken) {
+        console.warn('[VoiceChat] no signaling token present, skipping WebSocket connection');
+        return;
+      }
+
       // Try to construct a safe websocket URL. Use the URL API and origin
       // fallbacks so hosting rewrites or query tokens don't corrupt the host.
       const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';

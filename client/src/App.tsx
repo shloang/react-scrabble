@@ -60,7 +60,7 @@ function Router() {
   return (
       <Switch>
         <Route path="/" component={() => <ErrorBoundary><Game /></ErrorBoundary>} />
-        <Route path="/lobby" component={Lobby} />
+        <Route path="/lobby" component={() => <ErrorBoundary><Lobby /></ErrorBoundary>} />
         <Route component={NotFound} />
       </Switch>
   );
