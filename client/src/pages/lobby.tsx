@@ -133,6 +133,16 @@ export default function Lobby() {
   const { toast } = useToast();
   const queryClient = useQueryClient();
   const [, setLocation] = useLocation();
+  // Track whether the player deliberately navigated here (prevents auto-redirect back to game)
+  const voluntaryVisitRef = useRef<boolean>(false);
+  useEffect(() => {
+    try {
+      if (sessionStorage.getItem('voluntaryLobbyVisit') === '1') {
+        voluntaryVisitRef.current = true;
+        sessionStorage.removeItem('voluntaryLobbyVisit');
+      }
+    } catch {}
+  }, []);
 
   const { data: gameState, refetch } = useQuery({
     queryKey: ['/api/game'],
@@ -385,6 +395,7 @@ export default function Lobby() {
           // ignore refetch errors; still attempt navigation
         }
         // navigate to game
+        voluntaryVisitRef.current = false;
         setLocation('/');
         toast({ title: 'Игра начата' });
       } else {
@@ -456,6 +467,7 @@ export default function Lobby() {
   };
 
   const handleEnterGame = async () => {
+    voluntaryVisitRef.current = false;
     if (!gameInProgress) {
       toast({ title: 'Игра ещё не начата', description: 'Сначала нажмите «Начать игру»' });
       return;
@@ -721,6 +733,10 @@ export default function Lobby() {
   // authenticated lobby clients into the game so they don't need to click "Enter".
   useEffect(() => {
     if (!gameInProgress || authState !== 'valid') return;
+
+    // If the player deliberately navigated here (e.g. via "Back to Lobby"),
+    // skip the auto-redirect so they can stay in the lobby.
+    if (voluntaryVisitRef.current) return;
 
     // Refetch authoritative game state before navigating so the Game page
     // mounts with up-to-date data (avoids race conditions that can crash the UI).

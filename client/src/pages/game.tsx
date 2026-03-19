@@ -1466,6 +1466,7 @@ export default function Game() {
     pendingPatchRef.current.board = {};
     pendingPatchRef.current.rack = {};
     pendingPatchRef.current.timer = null;
+    try { sessionStorage.setItem('voluntaryLobbyVisit', '1'); } catch {}
     try { setLocation('/lobby'); } catch {}
     toast({ title: 'Вы вернулись в лобби' });
   };
@@ -1505,6 +1506,7 @@ export default function Game() {
               }}
               onNewGame={() => {
                 // Navigate back to lobby page
+                try { sessionStorage.setItem('voluntaryLobbyVisit', '1'); } catch {}
                 try { setLocation('/lobby'); } catch {}
                 setShowEndScreen(false);
                 setShowEndScreenMinimized(false);
