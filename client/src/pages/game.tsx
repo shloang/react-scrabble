@@ -141,6 +141,22 @@ export default function Game() {
     enabled: !isJoining
   });
 
+  // Defensive: if we have a locally-stored playerId but the authoritative
+  // gameState doesn't include that player yet (e.g. during start transition),
+  // show the Join dialog as a safe fallback to avoid dereferencing missing
+  // player objects elsewhere in this component.
+  useEffect(() => {
+    if (!playerId) return;
+    if (!gameState) return;
+    const found = Array.isArray(gameState.players) && gameState.players.some(p => p.id === playerId);
+    if (!found) {
+      setIsJoining(true);
+    } else {
+      // only clear joining when server confirms presence
+      setIsJoining(false);
+    }
+  }, [gameState, playerId]);
+
   const joinMutation = useMutation({
     mutationFn: (vars: { name: string; password: string }) => joinGameApi(vars.name, vars.password),
     onSuccess: (data, variables) => {
@@ -151,6 +167,9 @@ export default function Game() {
       try {
         localStorage.setItem('playerId', data.playerId);
         localStorage.setItem('playerName', name);
+        if (data.signalingToken) {
+          localStorage.setItem('signalingToken', data.signalingToken);
+        }
       } catch (err) {
         // ignore storage errors
       }
@@ -184,7 +203,17 @@ export default function Game() {
         await refetch();
       }
     },
-    onError: (error) => {
+    onError: async (error: any) => {
+      const message = String(error?.message || '');
+      if (message.toLowerCase().includes('stale')) {
+        try { await refetch(); } catch {}
+        toast({
+          variant: "destructive",
+          title: "Состояние обновилось",
+          description: 'Данные устарели, синхронизировали серверное состояние'
+        });
+        return;
+      }
       console.error('[Update] Mutation failed:', error);
       toast({
         variant: "destructive",
@@ -206,6 +235,17 @@ export default function Game() {
   const placedTilesRef = useRef<typeof placedTiles>(placedTiles);
   useEffect(() => { placedTilesRef.current = placedTiles; }, [placedTiles]);
   const submitMoveRef = useRef<(() => Promise<void>) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (pendingPatchRef.current.timer) {
+        clearTimeout(pendingPatchRef.current.timer as number);
+      }
+      pendingPatchRef.current.board = {};
+      pendingPatchRef.current.rack = {};
+      pendingPatchRef.current.timer = null;
+    };
+  }, []);
 
   function schedulePatch(patch: { board?: Record<string, any>; rack?: Record<number, any> }) {
     // merge into pending patch
@@ -240,16 +280,17 @@ export default function Game() {
         return;
       }
 
-      // apply board patches
+      // apply board patches (defensive: ensure board/rows exist)
       for (const key of Object.keys(pendingPatchRef.current.board)) {
         const [rStr, cStr] = key.split(',');
         const r = Number(rStr);
         const c = Number(cStr);
+        if (!base || !Array.isArray(base.board) || !Array.isArray(base.board[r])) continue;
         base.board[r][c] = pendingPatchRef.current.board[key];
       }
 
-      // apply rack patches for current player
-      const player = base.players.find(p => p.id === playerId);
+      // apply rack patches for current player (defensive: players may be missing briefly)
+      const player = Array.isArray(base.players) ? base.players.find(p => p.id === playerId) : undefined;
       if (player) {
         for (const idxStr of Object.keys(pendingPatchRef.current.rack)) {
           const idx = Number(idxStr);
@@ -281,9 +322,10 @@ export default function Game() {
           const c = Number(cStr);
           const isLocal = placedTilesRef.current.some(t => t.row === r && t.col === c);
           if (isLocal) continue;
+          if (!Array.isArray(base.board) || !Array.isArray(base.board[r])) continue;
           base.board[r][c] = pendingPatchRef.current.board[key];
         }
-        const player = base.players.find(p => p.id === playerId);
+        const player = Array.isArray(base.players) ? base.players.find(p => p.id === playerId) : undefined;
         if (player) {
           for (const idxStr of Object.keys(pendingPatchRef.current.rack)) {
             const idx = Number(idxStr);
@@ -301,20 +343,22 @@ export default function Game() {
   
 
     // Derived client-side preview state and helpers
-    const getCurrentPlayer = () => gameState?.players.find(p => p.id === playerId) || null;
+    const getCurrentPlayer = () => gameState?.players?.find(p => p.id === playerId) || null;
 
     const clientBoardState = useMemo(() => {
       if (!gameState) return null;
-      const b = structuredClone(gameState.board);
-      for (const t of placedTiles) {
-        b[t.row][t.col] = { letter: t.letter, blank: !!t.blank } as any;
-      }
+        const b = structuredClone(gameState.board);
+        for (const t of placedTiles) {
+          if (!Array.isArray(b)) continue;
+          if (!Array.isArray(b[t.row])) continue;
+          b[t.row][t.col] = { letter: t.letter, blank: !!t.blank } as any;
+        }
       return b;
     }, [gameState, placedTiles]);
 
     const clientRackState = useMemo(() => {
       if (!gameState || !playerId) return null;
-      const player = gameState.players.find(p => p.id === playerId);
+      const player = Array.isArray(gameState.players) ? gameState.players.find(p => p.id === playerId) : undefined;
       if (!player) return null;
       const rack = [...player.rack];
 
@@ -364,15 +408,20 @@ export default function Game() {
     // preview on the server for this player.
     useEffect(() => {
       let stopped = false;
-      if (!playerId) return;
-      const send = async () => {
-        try {
-          // Only send when we have placed tiles (or to clear them)
-          await sendPreview(playerId, placedTiles.map(t => ({ row: t.row, col: t.col, letter: t.letter, blank: !!t.blank })));
-        } catch (err) {
-          // ignore network errors for now
-        }
-      };
+        if (!playerId) return;
+        const send = async () => {
+          try {
+            // Defensive: ensure local player exists in authoritative state before
+            // attempting to send previews (avoids server/logic races when the
+            // local player isn't yet present after a start transition).
+            const cp = getCurrentPlayer();
+            if (!cp) return;
+            // Only send when we have placed tiles (or to clear them)
+            await sendPreview(playerId, placedTiles.map(t => ({ row: t.row, col: t.col, letter: t.letter, blank: !!t.blank })));
+          } catch (err) {
+            // ignore network errors for now
+          }
+        };
 
       // Send immediately once, then every 2s while placedTiles exist
       let interval: number | null = null;
@@ -496,7 +545,7 @@ export default function Game() {
       if (!statsUpdatedRef.current) {
         const winnerId = gameState.winnerId;
         if (winnerId) incrementWin(winnerId);
-        for (const p of gameState.players) {
+        for (const p of (gameState.players || [])) {
           if (p.id !== winnerId) incrementLoss(p.id);
         }
         statsUpdatedRef.current = true;
@@ -1049,7 +1098,7 @@ export default function Game() {
     if (!currentPlayer) return;
 
     const newState = structuredClone(gameState);
-    const newPlayer = newState.players.find(p => p.id === playerId);
+    const newPlayer = Array.isArray(newState.players) ? newState.players.find(p => p.id === playerId) : undefined;
     if (!newPlayer) return;
 
     // Return placed tiles to player's rack. Prefer to return to the original
@@ -1160,7 +1209,7 @@ export default function Game() {
       const score = calculateScore(words, boardForScore, placedTiles);
       
       const newState = structuredClone(gameState);
-      const currentPlayer = newState.players.find(p => p.id === playerId);
+      const currentPlayer = Array.isArray(newState.players) ? newState.players.find(p => p.id === playerId) : undefined;
       if (!currentPlayer) return;
 
       // Apply placed tiles to board state before sending to server
@@ -1184,11 +1233,16 @@ export default function Game() {
         }
       }
 
-      // Move to next player
-      const currentIndex = newState.players.findIndex(p => p.id === playerId);
-      const nextIndex = (currentIndex + 1) % newState.players.length;
-      newState.currentPlayer = newState.players[nextIndex].id;
-      newState.turn += 1;
+      // Move to next player (defensive around players array)
+      const currentIndex = Array.isArray(newState.players) ? newState.players.findIndex(p => p.id === playerId) : -1;
+      const playersLen = Array.isArray(newState.players) ? newState.players.length : 0;
+      if (playersLen === 0) {
+        newState.currentPlayer = null;
+      } else {
+        const nextIndex = (currentIndex + 1) % playersLen;
+        newState.currentPlayer = (Array.isArray(newState.players) ? newState.players[nextIndex] : undefined)?.id ?? null;
+        newState.turn += 1;
+      }
 
       // Append move to history
       newState.moves = newState.moves || [];
@@ -1250,13 +1304,18 @@ export default function Game() {
     if (!freshState.data) return;
 
     const newState = structuredClone(freshState.data);
-    const currentIndex = newState.players.findIndex(p => p.id === playerId);
-    const nextIndex = (currentIndex + 1) % newState.players.length;
-    newState.currentPlayer = newState.players[nextIndex].id;
-    newState.turn += 1;
+    const currentIndex = Array.isArray(newState.players) ? newState.players.findIndex(p => p.id === playerId) : -1;
+    const playersLen = Array.isArray(newState.players) ? newState.players.length : 0;
+    if (playersLen === 0) {
+      newState.currentPlayer = null;
+    } else {
+      const nextIndex = (currentIndex + 1) % playersLen;
+      newState.currentPlayer = (Array.isArray(newState.players) ? newState.players[nextIndex] : undefined)?.id ?? null;
+      newState.turn += 1;
+    }
     // Append skip entry to history
     newState.moves = newState.moves || [];
-    const skipPlayer = newState.players.find(p => p.id === playerId);
+    const skipPlayer = Array.isArray(newState.players) ? newState.players.find(p => p.id === playerId) : undefined;
     newState.moves.push({
       playerId: pid,
       playerName: skipPlayer?.name || '',
@@ -1306,7 +1365,7 @@ export default function Game() {
     // Work on the latest state snapshot
     const fresh = await getGameState();
     const newState = structuredClone(fresh || gameState);
-    const newPlayer = newState.players.find(p => p.id === playerId);
+    const newPlayer = Array.isArray(newState.players) ? newState.players.find(p => p.id === playerId) : undefined;
     if (!newPlayer) return;
 
     // Collect discarded letters and empty the selected slots
@@ -1337,15 +1396,20 @@ export default function Game() {
     }
 
     // Advance turn
-    const currentIndex = newState.players.findIndex(p => p.id === playerId);
-    const nextIndex = (currentIndex + 1) % newState.players.length;
-    newState.currentPlayer = newState.players[nextIndex].id;
-    newState.turn += 1;
+    const currentIndex = Array.isArray(newState.players) ? newState.players.findIndex(p => p.id === playerId) : -1;
+    const playersLen = Array.isArray(newState.players) ? newState.players.length : 0;
+    if (playersLen === 0) {
+      newState.currentPlayer = null;
+    } else {
+      const nextIndex = (currentIndex + 1) % playersLen;
+      newState.currentPlayer = (Array.isArray(newState.players) ? newState.players[nextIndex] : undefined)?.id ?? null;
+      newState.turn += 1;
+    }
 
     try {
       // Append exchange entry to history
       newState.moves = newState.moves || [];
-      const exchPlayer = newState.players.find(p => p.id === playerId);
+      const exchPlayer = Array.isArray(newState.players) ? newState.players.find(p => p.id === playerId) : undefined;
       newState.moves.push({
         playerId: pid,
         playerName: exchPlayer?.name || '',
@@ -1396,6 +1460,12 @@ export default function Game() {
   };
 
   const handleBackToLobby = async () => {
+    if (pendingPatchRef.current.timer) {
+      clearTimeout(pendingPatchRef.current.timer as number);
+    }
+    pendingPatchRef.current.board = {};
+    pendingPatchRef.current.rack = {};
+    pendingPatchRef.current.timer = null;
     try { setLocation('/lobby'); } catch {}
     toast({ title: 'Вы вернулись в лобби' });
   };
@@ -1468,7 +1538,7 @@ export default function Game() {
           <aside className="lg:w-72 flex flex-col gap-4">
             <h1 className="text-2xl font-bold">Игроки</h1>
             <div className="flex flex-row gap-2 overflow-x-auto">
-              {gameState.players.map((player, index) => (
+              {(gameState?.players || []).map((player, index) => (
                 <PlayerCard
                   key={player.id}
                   player={player}
@@ -1745,7 +1815,7 @@ export default function Game() {
                 </div>
                 {gameState && (
                   <div className="text-sm text-muted-foreground">
-                    Фишек в мешке: <span className="font-semibold">{gameState.tileBag.length}</span>
+                    Фишек в мешке: <span className="font-semibold">{gameState?.tileBag?.length ?? 0}</span>
                   </div>
                 )}
 

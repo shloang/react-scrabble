@@ -19,7 +19,7 @@ export async function initializeGame(): Promise<GameState> {
   return response.json();
 }
 
-export async function joinGame(playerName: string, password: string): Promise<{ playerId: string; gameState: GameState }> {
+export async function joinGame(playerName: string, password: string): Promise<{ playerId: string; gameState: GameState; signalingToken?: string; signalingTokenTtlMs?: number }> {
   const response = await fetch('/api/game/join', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

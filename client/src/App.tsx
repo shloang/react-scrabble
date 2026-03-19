@@ -9,6 +9,7 @@ import handleInvalidSession from "@/lib/session";
 import Game from "@/pages/game";
 import Lobby from "@/pages/lobby";
 import NotFound from "@/pages/not-found";
+import ErrorBoundary from "@/components/ErrorBoundary";
 
 function Router() {
   const [location, setLocation] = useLocation();
@@ -58,7 +59,7 @@ function Router() {
 
   return (
       <Switch>
-        <Route path="/" component={Game} />
+        <Route path="/" component={() => <ErrorBoundary><Game /></ErrorBoundary>} />
         <Route path="/lobby" component={Lobby} />
         <Route component={NotFound} />
       </Switch>

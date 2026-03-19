@@ -39,8 +39,16 @@ export interface Player {
   name: string;
   rack: (string | null)[];
   avatarUrl?: string;
+  avatarFallback?: AvatarFallbackData;
   score: number;
   ready?: boolean;
+}
+
+export interface AvatarFallbackData {
+  seed: string;
+  initials: string;
+  backgroundColor: string;
+  textColor: string;
 }
 
 
@@ -67,6 +75,7 @@ export type BoardCell = { letter: string; blank?: boolean } | null;
 export interface GameState {
   board: BoardCell[][];
   tileBag: string[];
+  revision?: number;
   players: Player[];
   currentPlayer: string | null;
   turn: number;
@@ -89,7 +98,25 @@ export const playerSchema = z.object({
   id: z.string(),
   name: z.string(),
   rack: z.array(z.string().nullable()),
-  avatarUrl: z.string().url().optional(),
+  avatarUrl: z.string().max(360000).refine((value) => {
+    const trimmed = value.trim();
+    if (!trimmed) return false;
+    if (/^data:/i.test(trimmed)) {
+      return /^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=\s]+$/i.test(trimmed);
+    }
+    try {
+      const parsed = new URL(trimmed);
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    } catch {
+      return false;
+    }
+  }, { message: 'avatarUrl must be an http(s) URL or a base64 data:image URL' }).optional(),
+  avatarFallback: z.object({
+    seed: z.string(),
+    initials: z.string(),
+    backgroundColor: z.string(),
+    textColor: z.string(),
+  }).optional(),
   score: z.number(),
   ready: z.boolean().optional(),
 });
@@ -102,6 +129,7 @@ export const boardCellSchema = z.object({
 export const gameStateSchema = z.object({
   board: z.array(z.array(boardCellSchema)),
   tileBag: z.array(z.string()),
+  revision: z.number().int().nonnegative().optional(),
   players: z.array(playerSchema),
   currentPlayer: z.string().nullable(),
   turn: z.number(),

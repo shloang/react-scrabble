@@ -7,6 +7,7 @@
     "dev": "NODE_ENV=development tsx server/index.ts",
     "build": "vite build && esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
     "start": "NODE_ENV=production node dist/index.js",
+    "test": "tsx --test tests/**/*.test.ts",
     "turn:start": "npx node-turn --ports 3478 --username testuser --password testpass --realm react-scrabble",
     "check": "tsc",
     "turn:dev": "cross-env TURN_EMBED=1 NODE_ENV=development tsx server/index.ts",

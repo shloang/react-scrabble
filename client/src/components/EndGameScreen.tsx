@@ -12,8 +12,8 @@ interface EndGameScreenProps {
 }
 
 export default function EndGameScreen({ gameState, currentPlayerId, onNewGame, onClose, onMinimize }: EndGameScreenProps) {
-  const winner = gameState.players.find(p => p.id === gameState.winnerId);
-  const currentPlayer = gameState.players.find(p => p.id === currentPlayerId);
+  const winner = (gameState.players || []).find(p => p.id === gameState.winnerId) || null;
+  const currentPlayer = (gameState.players || []).find(p => p.id === currentPlayerId) || null;
   const isWinner = winner?.id === currentPlayerId;
 
   // Calculate statistics
@@ -112,8 +112,7 @@ export default function EndGameScreen({ gameState, currentPlayerId, onNewGame, o
               <h3 className="font-semibold">Итоговые очки</h3>
             </div>
             <div className="space-y-2">
-              {gameState.players
-                .sort((a, b) => b.score - a.score)
+              {(gameState.players || []).slice().sort((a, b) => b.score - a.score)
                 .map((player, idx) => (
                   <div key={player.id} className="flex justify-between items-center">
                     <span className={player.id === gameState.winnerId ? 'font-bold' : ''}>

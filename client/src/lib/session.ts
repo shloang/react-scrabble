@@ -4,7 +4,11 @@ import { clearAuthCache } from './auth';
 export async function handleInvalidSession(queryClient?: QueryClient, options?: { navigateTo?: string }) {
   try {
     // Clear persisted session
-    try { localStorage.removeItem('playerId'); localStorage.removeItem('playerName'); } catch {}
+    try {
+      localStorage.removeItem('playerId');
+      localStorage.removeItem('playerName');
+      localStorage.removeItem('signalingToken');
+    } catch {}
 
     // Clear in-memory auth cache
     try { clearAuthCache(); } catch {}

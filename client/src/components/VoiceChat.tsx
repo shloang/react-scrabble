@@ -4,14 +4,35 @@ interface VoiceChatProps {
   playerId: string | null;
   voiceVolume?: number; // global multiplier for voice audio (0..1)
   playerNames?: Record<string, string>;
-  onStateUpdate?: (state: { peerVolumes: Record<string, number>; peerMuted: Record<string, boolean>; peerStatuses: Record<string, string>; levels: Record<string, number> }) => void;
+  showControls?: boolean;
+  autoStartMic?: boolean;
+  onStateUpdate?: (state: {
+    peerVolumes: Record<string, number>;
+    peerMuted: Record<string, boolean>;
+    peerStatuses: Record<string, string>;
+    levels: Record<string, number>;
+    wsState: 'connecting' | 'open' | 'closed' | 'error' | 'none';
+    peers: string[];
+    micEnabled: boolean;
+  }) => void;
   externalPeerMuted?: Record<string, boolean> | null;
   externalPeerVolumes?: Record<string, number> | null;
+  externalMicMuted?: boolean | null;
 }
 
 type SignalMsg = any;
 
-export default function VoiceChat({ playerId, voiceVolume = 1, playerNames, onStateUpdate, externalPeerMuted = null, externalPeerVolumes = null }: VoiceChatProps) {
+export default function VoiceChat({
+  playerId,
+  voiceVolume = 1,
+  playerNames,
+  showControls = true,
+  autoStartMic = false,
+  onStateUpdate,
+  externalPeerMuted = null,
+  externalPeerVolumes = null,
+  externalMicMuted = null,
+}: VoiceChatProps) {
   const wsRef = useRef<WebSocket | null>(null);
   const [wsState, setWsState] = useState<'connecting' | 'open' | 'closed' | 'error' | 'none'>('none');
   const pcRefs = useRef<Record<string, RTCPeerConnection>>({});
@@ -27,8 +48,19 @@ export default function VoiceChat({ playerId, voiceVolume = 1, playerNames, onSt
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analysersRef = useRef<Record<string, AnalyserNode>>({});
   const rafRef = useRef<number | null>(null);
+  const idleLevelTimerRef = useRef<number | null>(null);
   const [levels, setLevels] = useState<Record<string, number>>({});
   const pendingCandidatesRef = useRef<Record<string, RTCIceCandidateInit[]>>({});
+  const levelSampleBufferRef = useRef<Uint8Array>(new Uint8Array(64));
+  const lastLevelSampleAtRef = useRef(0);
+
+  const getSignalingToken = () => {
+    try {
+      return localStorage.getItem('signalingToken');
+    } catch {
+      return null;
+    }
+  };
 
   useEffect(() => {
     if (!playerId) return;
@@ -79,7 +111,20 @@ export default function VoiceChat({ playerId, voiceVolume = 1, playerNames, onSt
       wsRef.current = ws;
       setWsState('connecting');
 
-      const onOpen = () => { console.log('[VoiceChat] ws open'); setWsState('open'); try { ws!.send(JSON.stringify({ type: 'join', playerId })); } catch (e) {} };
+      const onOpen = () => {
+        console.log('[VoiceChat] ws open');
+        setWsState('open');
+        try {
+          const signalingToken = getSignalingToken();
+          if (!signalingToken) {
+            console.warn('[VoiceChat] missing signaling token, closing websocket');
+            setWsState('error');
+            ws!.close();
+            return;
+          }
+          ws!.send(JSON.stringify({ type: 'join', playerId, signalingToken }));
+        } catch (e) {}
+      };
       const onError = (ev: any) => { console.error('[VoiceChat] ws error', ev); setWsState('error'); };
       const onClose = () => { console.log('[VoiceChat] ws closed'); setWsState('closed'); };
       const onMessage = async (ev: MessageEvent) => {
@@ -121,8 +166,22 @@ export default function VoiceChat({ playerId, voiceVolume = 1, playerNames, onSt
         ws.removeEventListener('close', onClose);
         ws.removeEventListener('message', onMessage as any);
         for (const pid of Object.keys(pcRefs.current)) cleanupPeer(pid);
-        try { if (rafRef.current) cancelAnimationFrame(rafRef.current); rafRef.current = null; } catch (err) {}
+        try {
+          if (rafRef.current) cancelAnimationFrame(rafRef.current);
+          if (idleLevelTimerRef.current) clearTimeout(idleLevelTimerRef.current);
+          rafRef.current = null;
+          idleLevelTimerRef.current = null;
+        } catch (err) {}
         try { for (const k of Object.keys(analysersRef.current)) { try { analysersRef.current[k].disconnect(); } catch (err) {} delete analysersRef.current[k]; } if (audioCtxRef.current) { try { audioCtxRef.current.close(); } catch (err) {} audioCtxRef.current = null; } } catch (err) {}
+        try {
+          if (localStreamRef.current) {
+            for (const track of localStreamRef.current.getTracks()) track.stop();
+            localStreamRef.current = null;
+          }
+        } catch (err) {}
+        setMicEnabled(false);
+        setPeers([]);
+        setWsState('none');
         wsRef.current = null;
       };
     };
@@ -174,6 +233,7 @@ export default function VoiceChat({ playerId, voiceVolume = 1, playerNames, onSt
       const s = await navigator.mediaDevices.getUserMedia({ audio: true });
       console.log('[VoiceChat] getUserMedia success, tracks=', s.getTracks().map(t=>t.kind));
       localStreamRef.current = s;
+      setMicEnabled(true);
       return s;
     } catch (err) {
       console.error('getUserMedia failed', err);
@@ -474,9 +534,19 @@ export default function VoiceChat({ playerId, voiceVolume = 1, playerNames, onSt
   // Notify parent of current voice state when anything changes
   useEffect(() => {
     if (typeof onStateUpdate === 'function') {
-      try { onStateUpdate({ peerVolumes, peerMuted, peerStatuses, levels }); } catch (e) { /* ignore */ }
+      try {
+        onStateUpdate({
+          peerVolumes,
+          peerMuted,
+          peerStatuses,
+          levels,
+          wsState,
+          peers,
+          micEnabled,
+        });
+      } catch (e) { /* ignore */ }
     }
-  }, [peerVolumes, peerMuted, peerStatuses, levels, onStateUpdate]);
+  }, [peerVolumes, peerMuted, peerStatuses, levels, wsState, peers, micEnabled, onStateUpdate]);
 
   // Apply external overrides from parent when props change
   useEffect(() => {
@@ -486,33 +556,110 @@ export default function VoiceChat({ playerId, voiceVolume = 1, playerNames, onSt
     if (externalPeerVolumes) setPeerVolumes(prev => ({ ...prev, ...externalPeerVolumes }));
   }, [externalPeerVolumes]);
 
+  useEffect(() => {
+    if (!autoStartMic || micEnabled) return;
+    (async () => {
+      try {
+        await ensureLocalStream();
+        await addLocalTracksToPeers();
+      } catch (err) {
+        setMicEnabled(false);
+      }
+    })();
+  }, [autoStartMic, micEnabled]);
+
+  // Allow parent UI to mute/unmute local mic tracks without tearing down signaling.
+  useEffect(() => {
+    if (externalMicMuted === null || externalMicMuted === undefined) return;
+    const stream = localStreamRef.current;
+    if (!stream) return;
+    for (const track of stream.getAudioTracks()) {
+      track.enabled = !externalMicMuted;
+    }
+  }, [externalMicMuted, micEnabled]);
+
   // RAF loop to sample analyser nodes and compute per-peer levels
   useEffect(() => {
     let cancelled = false;
-    const buf = new Uint8Array(128);
-    const loop = () => {
+    const minSampleIntervalMs = 120;
+    const loop = (now = performance.now()) => {
       if (cancelled) return;
+      const isDocHidden = typeof document !== 'undefined' ? document.hidden : false;
+      const analyserIds = Object.keys(analysersRef.current);
+      if (analyserIds.length === 0) {
+        idleLevelTimerRef.current = window.setTimeout(() => {
+          rafRef.current = requestAnimationFrame(loop);
+        }, 250) as unknown as number;
+        return;
+      }
+
+      if (isDocHidden) {
+        idleLevelTimerRef.current = window.setTimeout(() => {
+          rafRef.current = requestAnimationFrame(loop);
+        }, 400) as unknown as number;
+        return;
+      }
+
+      if (now - lastLevelSampleAtRef.current < minSampleIntervalMs) {
+        rafRef.current = requestAnimationFrame(loop);
+        return;
+      }
+      lastLevelSampleAtRef.current = now;
+
+      const buf = levelSampleBufferRef.current;
       const nextLevels: Record<string, number> = {};
-      for (const pid of Object.keys(analysersRef.current)) {
+      for (const pid of analyserIds) {
         try {
           const analyser = analysersRef.current[pid];
           analyser.getByteFrequencyData(buf);
           let sum = 0;
           for (let i = 0; i < buf.length; i++) sum += buf[i];
           const avg = sum / buf.length;
-          nextLevels[pid] = Math.min(1, Math.max(0, avg / 255));
+          const normalized = Math.min(1, Math.max(0, avg / 255));
+          nextLevels[pid] = Math.round(normalized * 20) / 20;
         } catch (err) {
           nextLevels[pid] = 0;
         }
       }
-      setLevels(prev => ({ ...prev, ...nextLevels }));
+      setLevels(prev => {
+        let changed = false;
+        const merged = { ...prev };
+        for (const pid of Object.keys(merged)) {
+          if (!Object.prototype.hasOwnProperty.call(nextLevels, pid)) {
+            delete merged[pid];
+            changed = true;
+          }
+        }
+        for (const pid of Object.keys(nextLevels)) {
+          const next = nextLevels[pid];
+          const current = merged[pid] ?? 0;
+          if (Math.abs(current - next) >= 0.04) {
+            merged[pid] = next;
+            changed = true;
+          }
+        }
+        return changed ? merged : prev;
+      });
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop);
-    return () => { cancelled = true; if (rafRef.current) cancelAnimationFrame(rafRef.current); rafRef.current = null; };
+    return () => {
+      cancelled = true;
+      if (rafRef.current) {
+        cancelAnimationFrame(rafRef.current);
+      }
+      if (idleLevelTimerRef.current) clearTimeout(idleLevelTimerRef.current);
+      rafRef.current = null;
+      idleLevelTimerRef.current = null;
+      lastLevelSampleAtRef.current = 0;
+    };
   }, []);
 
-    return (
+  if (!showControls) {
+    return null;
+  }
+
+  return (
     <div className="voice-chat">
       <div className="flex items-center gap-2">
         <button

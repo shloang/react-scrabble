@@ -20,6 +20,14 @@ export default function VoiceChatMinimal({ playerId, voiceVolume = 1, playerName
   const [micEnabled, setMicEnabled] = useState(false);
   const [peers, setPeers] = useState<string[]>([]);
 
+  const getSignalingToken = () => {
+    try {
+      return localStorage.getItem('signalingToken');
+    } catch {
+      return null;
+    }
+  };
+
   useEffect(() => {
     if (!playerId) return;
 
@@ -51,7 +59,16 @@ export default function VoiceChatMinimal({ playerId, voiceVolume = 1, playerName
       const onOpen = () => {
         console.log('[VoiceChat] ws open');
         setWsState('open');
-        try { ws!.send(JSON.stringify({ type: 'join', playerId })); } catch (e) {}
+        try {
+          const signalingToken = getSignalingToken();
+          if (!signalingToken) {
+            console.warn('[VoiceChat] missing signaling token, closing websocket');
+            setWsState('error');
+            ws!.close();
+            return;
+          }
+          ws!.send(JSON.stringify({ type: 'join', playerId, signalingToken }));
+        } catch (e) {}
         try {
           wsKeepaliveTimer = window.setInterval(() => {
             try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ws-ping' })); } catch (e) {}
@@ -159,7 +176,7 @@ export default function VoiceChatMinimal({ playerId, voiceVolume = 1, playerName
     const pc = new RTCPeerConnection(cfg);
     pcRefs.current[remoteId] = pc;
     pc.onicecandidate = (ev) => { if (ev.candidate) sendSignal({ type: 'candidate', to: remoteId, from: playerId, candidate: ev.candidate }); };
-    pc.ontrack = (ev) => { const stream = (ev.streams && ev.streams[0]) || null; if (stream) { let audio = audioEls.current[remoteId]; if (!audio) { audio = document.createElement('audio'); audio.autoplay = true; (audio as any).playsInline = true; audioEls.current[remoteId] = audio; } audio.srcObject = stream; audio.volume = 1 * (voiceVolume ?? 1); audio.play().catch(() => {}); } };
+    pc.ontrack = (ev) => { const stream = (ev.streams && ev.streams[0]) || null; if (stream) { let audio = audioEls.current[remoteId]; if (!audio) { audio = document.createElement('audio'); audio.autoplay = true; (audio as any).playsInline = true; audioEls.current[remoteId] = audio; } audio.srcObject = stream; try { audio.volume = Number(voiceVolume ?? 1); } catch (e) {} audio.play().catch(() => {}); } };
 
     pc.oniceconnectionstatechange = () => {
       try {

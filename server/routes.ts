@@ -1,5 +1,6 @@
 import type { Express } from "express";
 import net from 'net';
+import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import { createServer, type Server } from "http";
 import { WebSocketServer, WebSocket } from 'ws';
 import { storage } from "./storage";
@@ -17,6 +18,462 @@ if (USE_WORD_FILE) {
 }
 
 export async function registerRoutes(app: Express): Promise<Server> {
+  let stateMutationQueue: Promise<void> = Promise.resolve();
+  type VoiceTokenRecord = { hash: string; expiresAt: number };
+  type CachedStatsEntry = {
+    playerId: string;
+    score: number;
+    wins: number;
+    losses: number;
+    games: number;
+    cachedAt: number;
+    staleAt: number;
+    expiresAt: number;
+    stateRevision: number;
+  };
+  const voiceTokens = new Map<string, VoiceTokenRecord>();
+  const playerStatsCache = new Map<string, CachedStatsEntry>();
+  const playerStatsCacheLogSignatures = new Map<string, string>();
+  const playerStatsCacheStatusByPlayer = new Map<string, string>();
+
+  const MAX_AVATAR_REMOTE_URL_LENGTH = 1024;
+  const MAX_AVATAR_DATA_URL_LENGTH = parseInt(process.env.MAX_AVATAR_DATA_URL_LENGTH || '360000', 10);
+  const MAX_AVATAR_DATA_BYTES = parseInt(process.env.MAX_AVATAR_DATA_BYTES || '262144', 10);
+  const ALLOWED_AVATAR_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+  const AVATAR_FALLBACK_PALETTE: Array<{ backgroundColor: string; textColor: string }> = [
+    { backgroundColor: '#0f766e', textColor: '#ecfeff' },
+    { backgroundColor: '#1d4ed8', textColor: '#eff6ff' },
+    { backgroundColor: '#7c2d12', textColor: '#fff7ed' },
+    { backgroundColor: '#3f3f46', textColor: '#f4f4f5' },
+    { backgroundColor: '#166534', textColor: '#f0fdf4' },
+    { backgroundColor: '#831843', textColor: '#fdf2f8' },
+    { backgroundColor: '#4338ca', textColor: '#eef2ff' },
+    { backgroundColor: '#92400e', textColor: '#fffbeb' },
+  ];
+
+  const VOICE_TOKEN_TTL_MS = parseInt(process.env.VOICE_TOKEN_TTL_MS || '7200000', 10);
+  const FUTURE_SKEW_MS = 5000;
+
+  function boundedMs(rawValue: string | undefined, fallbackMs: number, minMs: number, maxMs: number): number {
+    const parsed = parseInt(String(rawValue || fallbackMs), 10);
+    if (!Number.isFinite(parsed)) return fallbackMs;
+    return Math.min(maxMs, Math.max(minMs, parsed));
+  }
+
+  const PLAYER_STATS_FRESH_MS = boundedMs(
+    process.env.PLAYER_STATS_FRESH_MS,
+    5 * 60 * 1000,
+    30 * 1000,
+    7 * 24 * 60 * 60 * 1000,
+  );
+  const PLAYER_STATS_STALE_MS = Math.max(
+    PLAYER_STATS_FRESH_MS,
+    boundedMs(
+      process.env.PLAYER_STATS_STALE_MS,
+      24 * 60 * 60 * 1000,
+      60 * 1000,
+      30 * 24 * 60 * 60 * 1000,
+    ),
+  );
+  const PLAYER_STATS_EXPIRE_MS = Math.max(
+    PLAYER_STATS_STALE_MS,
+    boundedMs(
+      process.env.PLAYER_STATS_EXPIRE_MS,
+      7 * 24 * 60 * 60 * 1000,
+      5 * 60 * 1000,
+      90 * 24 * 60 * 60 * 1000,
+    ),
+  );
+
+  function tokenHash(value: string): string {
+    return createHash('sha256').update(value).digest('hex');
+  }
+
+  function issueVoiceToken(playerId: string): string {
+    const token = randomBytes(32).toString('hex');
+    voiceTokens.set(playerId, {
+      hash: tokenHash(token),
+      expiresAt: Date.now() + VOICE_TOKEN_TTL_MS,
+    });
+    return token;
+  }
+
+  function revokeVoiceToken(playerId: string) {
+    voiceTokens.delete(playerId);
+  }
+
+  function verifyVoiceToken(playerId: string, token: string): boolean {
+    const rec = voiceTokens.get(playerId);
+    if (!rec) return false;
+    if (Date.now() > rec.expiresAt) {
+      voiceTokens.delete(playerId);
+      return false;
+    }
+    const expected = Buffer.from(rec.hash, 'hex');
+    const actual = Buffer.from(tokenHash(token), 'hex');
+    if (expected.length !== actual.length) return false;
+    return timingSafeEqual(expected, actual);
+  }
+
+  function pruneExpiredVoiceTokens() {
+    const now = Date.now();
+    for (const [playerId, rec] of Array.from(voiceTokens.entries())) {
+      if (now > rec.expiresAt) {
+        voiceTokens.delete(playerId);
+      }
+    }
+  }
+
+  async function withStateMutationLock<T>(work: () => Promise<T>): Promise<T> {
+    const previous = stateMutationQueue;
+    let release!: () => void;
+    stateMutationQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await work();
+    } finally {
+      release();
+    }
+  }
+
+  function runLocked(handler: (req: any, res: any) => Promise<any>) {
+    return async (req: any, res: any) => {
+      return withStateMutationLock(() => handler(req, res));
+    };
+  }
+
+  function stateRevision(state?: GameState | null): number {
+    return typeof state?.revision === "number" ? state.revision : 0;
+  }
+
+  function bumpRevision(state: GameState): GameState {
+    state.revision = stateRevision(state) + 1;
+    return state;
+  }
+
+  function fallbackInitials(name: string): string {
+    const trimmed = String(name || '').trim().replace(/\s+/g, ' ');
+    if (!trimmed) return '??';
+    const parts = trimmed.split(' ').filter(Boolean);
+    if (parts.length >= 2) {
+      const a = Array.from(parts[0])[0] || '?';
+      const b = Array.from(parts[1])[0] || '?';
+      return `${a}${b}`.toUpperCase();
+    }
+    const chars = Array.from(parts[0]);
+    const first = chars[0] || '?';
+    const second = chars[1] || first || '?';
+    return `${first}${second}`.toUpperCase();
+  }
+
+  function buildAvatarFallback(player: Pick<Player, 'id' | 'name'>): Player['avatarFallback'] {
+    const seed = createHash('sha256').update(`${player.id}:${String(player.name || '').trim().toLowerCase()}`).digest('hex').slice(0, 16);
+    const idx = parseInt(seed.slice(0, 8), 16) % AVATAR_FALLBACK_PALETTE.length;
+    const palette = AVATAR_FALLBACK_PALETTE[idx];
+    return {
+      seed,
+      initials: fallbackInitials(player.name),
+      backgroundColor: palette.backgroundColor,
+      textColor: palette.textColor,
+    };
+  }
+
+  function sanitizeAvatarUrlInput(rawValue: unknown): { avatarUrl?: string; error?: string } {
+    if (rawValue === null || rawValue === undefined) return {};
+    if (typeof rawValue !== 'string') return { error: 'avatarUrl must be a string when provided' };
+
+    const trimmed = rawValue.trim();
+    if (!trimmed) return {};
+
+    if (/[\u0000-\u001F\u007F]/.test(trimmed)) {
+      return { error: 'avatarUrl contains control characters' };
+    }
+
+    if (/^data:/i.test(trimmed)) {
+      if (trimmed.length > MAX_AVATAR_DATA_URL_LENGTH) {
+        return { error: `avatar data URL exceeds ${MAX_AVATAR_DATA_URL_LENGTH} characters` };
+      }
+      const m = trimmed.match(/^data:([^;,]+);base64,([A-Za-z0-9+/=\s]+)$/i);
+      if (!m) return { error: 'avatar data URL must be base64 encoded image data' };
+
+      const normalizedMime = m[1].toLowerCase() === 'image/jpg' ? 'image/jpeg' : m[1].toLowerCase();
+      if (!ALLOWED_AVATAR_MIME.has(normalizedMime)) {
+        return { error: `avatar content type ${normalizedMime} is not allowed` };
+      }
+
+      const base64Payload = m[2].replace(/\s+/g, '');
+      if (!base64Payload || !/^[A-Za-z0-9+/]+={0,2}$/.test(base64Payload)) {
+        return { error: 'avatar data URL payload is not valid base64' };
+      }
+
+      const bytes = Buffer.byteLength(base64Payload, 'base64');
+      if (!Number.isFinite(bytes) || bytes <= 0) {
+        return { error: 'avatar data URL payload is empty' };
+      }
+      if (bytes > MAX_AVATAR_DATA_BYTES) {
+        return { error: `avatar upload too large (${bytes} bytes > ${MAX_AVATAR_DATA_BYTES} bytes)` };
+      }
+
+      return { avatarUrl: `data:${normalizedMime};base64,${base64Payload}` };
+    }
+
+    if (trimmed.length > MAX_AVATAR_REMOTE_URL_LENGTH) {
+      return { error: `avatarUrl exceeds ${MAX_AVATAR_REMOTE_URL_LENGTH} characters` };
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      return { error: 'avatarUrl must be a valid absolute URL' };
+    }
+
+    if (!/^https?:$/i.test(parsed.protocol)) {
+      return { error: 'avatarUrl must use http or https' };
+    }
+    if (parsed.username || parsed.password) {
+      return { error: 'avatarUrl cannot include credentials' };
+    }
+
+    const normalized = parsed.toString();
+    if (normalized.length > MAX_AVATAR_REMOTE_URL_LENGTH) {
+      return { error: `normalized avatarUrl exceeds ${MAX_AVATAR_REMOTE_URL_LENGTH} characters` };
+    }
+
+    return { avatarUrl: normalized };
+  }
+
+  function normalizePlayerAvatar(player: Player): { changed: boolean; invalidReason?: string } {
+    const previousUrl = typeof player.avatarUrl === 'string' ? player.avatarUrl : undefined;
+    const previousFallback = player.avatarFallback;
+    const sanitized = sanitizeAvatarUrlInput(previousUrl);
+
+    if (sanitized.avatarUrl) player.avatarUrl = sanitized.avatarUrl;
+    else delete (player as any).avatarUrl;
+
+    const fallback = buildAvatarFallback(player);
+    player.avatarFallback = fallback;
+
+    const fallbackChanged = !previousFallback
+      || previousFallback.seed !== fallback.seed
+      || previousFallback.initials !== fallback.initials
+      || previousFallback.backgroundColor !== fallback.backgroundColor
+      || previousFallback.textColor !== fallback.textColor;
+
+    return {
+      changed: previousUrl !== player.avatarUrl || fallbackChanged,
+      invalidReason: sanitized.error,
+    };
+  }
+
+  function normalizeGameStateAvatars(state?: GameState | null): boolean {
+    if (!state || !Array.isArray(state.players)) return false;
+    let changed = false;
+    for (const p of state.players) {
+      const result = normalizePlayerAvatar(p);
+      if (result.changed) changed = true;
+    }
+    return changed;
+  }
+
+  function gameInProgress(state?: GameState | null): boolean {
+    if (!state) return false;
+    return !!state.currentPlayer && (state.turn || 0) > 0 && !state.gameEnded;
+  }
+
+  function headerValue(value: string | string[] | undefined): string {
+    if (Array.isArray(value)) return String(value[0] || '').trim();
+    return String(value || '').trim();
+  }
+
+  function parseRequesterCredentials(req: any): { requesterId: string; requesterPassword: string } {
+    const requesterIdFromQuery = typeof req.query?.requesterId === 'string' ? req.query.requesterId : '';
+    const requesterPasswordFromQuery = typeof req.query?.requesterPassword === 'string' ? req.query.requesterPassword : '';
+    const requesterIdFromHeader = headerValue(req.headers?.['x-player-id']);
+    const requesterPasswordFromHeader = headerValue(req.headers?.['x-player-password']);
+
+    return {
+      requesterId: String(requesterIdFromQuery || requesterIdFromHeader || '').trim(),
+      requesterPassword: String(requesterPasswordFromQuery || requesterPasswordFromHeader || '').trim(),
+    };
+  }
+
+  async function authorizePlayerStatsRead(req: any, state: GameState): Promise<{ allowed: true; mode: string } | { allowed: false; status: number; error: string }> {
+    const { requesterId, requesterPassword } = parseRequesterCredentials(req);
+
+    // Backward compatibility for current lobby behavior: before game start,
+    // stats can be fetched without explicit requester credentials.
+    if (!requesterId) {
+      if (gameInProgress(state)) {
+        return {
+          allowed: false,
+          status: 401,
+          error: 'requesterId required once game has started',
+        };
+      }
+      return { allowed: true, mode: 'legacy-anonymous' };
+    }
+
+    const requester = state.players.find((pl) => pl.id === requesterId);
+    if (!requester) {
+      return {
+        allowed: false,
+        status: 403,
+        error: 'Requester is not a participant in this game',
+      };
+    }
+
+    if (requesterPassword) {
+      const ok = await storage.verifyPlayerPassword(requesterId, requesterPassword);
+      if (!ok) {
+        return {
+          allowed: false,
+          status: 401,
+          error: 'Invalid requester credentials',
+        };
+      }
+      return { allowed: true, mode: 'participant-password' };
+    }
+
+    return { allowed: true, mode: 'participant-id' };
+  }
+
+  function hasValidStatsMetadata(entry: CachedStatsEntry, now: number): boolean {
+    if (!entry || typeof entry !== 'object') return false;
+    if (!Number.isFinite(entry.cachedAt) || !Number.isFinite(entry.staleAt) || !Number.isFinite(entry.expiresAt)) return false;
+    if (!Number.isFinite(entry.wins) || !Number.isFinite(entry.losses) || !Number.isFinite(entry.games) || !Number.isFinite(entry.score)) return false;
+    if (!Number.isFinite(entry.stateRevision)) return false;
+    if (entry.cachedAt > now + FUTURE_SKEW_MS) return false;
+    if (entry.staleAt < entry.cachedAt) return false;
+    if (entry.expiresAt < entry.staleAt) return false;
+    const staleWindowMs = entry.staleAt - entry.cachedAt;
+    const expireWindowMs = entry.expiresAt - entry.cachedAt;
+    if (staleWindowMs < PLAYER_STATS_FRESH_MS) return false;
+    if (staleWindowMs > PLAYER_STATS_STALE_MS + FUTURE_SKEW_MS) return false;
+    if (expireWindowMs < PLAYER_STATS_STALE_MS) return false;
+    if (expireWindowMs > PLAYER_STATS_EXPIRE_MS + FUTURE_SKEW_MS) return false;
+    return true;
+  }
+
+  function buildStatsCacheEntry(player: Player, revision: number, now: number): CachedStatsEntry {
+    return {
+      playerId: player.id,
+      score: Number(player.score) || 0,
+      wins: 0,
+      losses: 0,
+      games: 1,
+      cachedAt: now,
+      staleAt: now + PLAYER_STATS_STALE_MS,
+      expiresAt: now + PLAYER_STATS_EXPIRE_MS,
+      stateRevision: Math.max(0, Number(revision) || 0),
+    };
+  }
+
+  function buildStatsResponse(entry: CachedStatsEntry, now: number) {
+    const ageMs = Math.max(0, now - entry.cachedAt);
+    const isExpired = now >= entry.expiresAt;
+    const isStale = isExpired || now >= entry.staleAt;
+    const cacheStatus = isExpired ? 'expired' : (isStale ? 'stale' : 'fresh');
+
+    return {
+      playerId: entry.playerId,
+      score: entry.score,
+      wins: entry.wins,
+      losses: entry.losses,
+      games: entry.games,
+      cachedAt: entry.cachedAt,
+      staleAt: entry.staleAt,
+      expiresAt: entry.expiresAt,
+      isStale,
+      isExpired,
+      cacheStatus,
+      ageMs,
+      source: 'server-snapshot',
+    };
+  }
+
+  function logPlayerStatsCacheEvent(playerId: string, payload: {
+    event: 'hit' | 'miss' | 'repair';
+    reason: string;
+    cacheStatus: 'fresh' | 'stale' | 'expired';
+    revision: number;
+    score: number;
+    ageMs: number;
+    authMode: string;
+  }) {
+    const signature = [
+      payload.event,
+      payload.reason,
+      payload.cacheStatus,
+      payload.revision,
+      payload.score,
+      Math.floor(payload.ageMs / 1000),
+      payload.authMode,
+    ].join('|');
+
+    const previous = playerStatsCacheLogSignatures.get(playerId);
+    if (previous === signature) return;
+    playerStatsCacheLogSignatures.set(playerId, signature);
+
+    console.info('[PlayerStatsCache]', {
+      playerId,
+      ...payload,
+    });
+
+    const prevStatus = playerStatsCacheStatusByPlayer.get(playerId);
+    if (prevStatus !== payload.cacheStatus) {
+      console.info('[PlayerStatsCacheTransition]', {
+        playerId,
+        from: prevStatus || 'none',
+        to: payload.cacheStatus,
+      });
+      playerStatsCacheStatusByPlayer.set(playerId, payload.cacheStatus);
+    }
+  }
+
+  function isStatsResponseConsistent(response: ReturnType<typeof buildStatsResponse>, now: number): boolean {
+    if (!Number.isFinite(response.cachedAt) || !Number.isFinite(response.staleAt) || !Number.isFinite(response.expiresAt)) return false;
+    if (response.cachedAt > now + FUTURE_SKEW_MS) return false;
+    if (response.staleAt < response.cachedAt) return false;
+    if (response.expiresAt < response.staleAt) return false;
+    const staleWindowMs = response.staleAt - response.cachedAt;
+    const expireWindowMs = response.expiresAt - response.cachedAt;
+    if (staleWindowMs < PLAYER_STATS_FRESH_MS) return false;
+    if (staleWindowMs > PLAYER_STATS_STALE_MS + FUTURE_SKEW_MS) return false;
+    if (expireWindowMs < PLAYER_STATS_STALE_MS) return false;
+    if (expireWindowMs > PLAYER_STATS_EXPIRE_MS + FUTURE_SKEW_MS) return false;
+    if (!['fresh', 'stale', 'expired'].includes(response.cacheStatus)) return false;
+    return true;
+  }
+
+  function cleanupPlayerStatsCache(state: GameState, now: number, revision: number) {
+    const playersById = new Map((state.players || []).map((pl) => [pl.id, pl]));
+
+    for (const [key, entry] of Array.from(playerStatsCache.entries())) {
+      const livePlayer = playersById.get(key);
+      if (!livePlayer) {
+        playerStatsCache.delete(key);
+        playerStatsCacheLogSignatures.delete(key);
+        playerStatsCacheStatusByPlayer.delete(key);
+        continue;
+      }
+
+      const liveScore = Number(livePlayer.score) || 0;
+      const shouldDrop = !hasValidStatsMetadata(entry, now)
+        || now >= entry.expiresAt
+        || entry.playerId !== key
+        || entry.stateRevision !== revision
+        || entry.score !== liveScore;
+
+      if (shouldDrop) {
+        playerStatsCache.delete(key);
+        playerStatsCacheLogSignatures.delete(key);
+      }
+    }
+  }
+
   function createEmptyGameState(): GameState {
     const bag: string[] = [];
     Object.entries(TILE_DISTRIBUTION).forEach(([letter, count]) => {
@@ -33,6 +490,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     return {
       board: Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(null)),
       tileBag: bag,
+      revision: 0,
       players: [],
       currentPlayer: null,
       turn: 0,
@@ -52,6 +510,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.get("/api/game", async (req, res) => {
     try {
       const gameState = await storage.getGameState();
+      normalizeGameStateAvatars(gameState);
       res.json(gameState || null);
     } catch (error) {
       res.status(500).json({ error: "Failed to get game state" });
@@ -67,9 +526,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!state || !Array.isArray(state.players)) return res.status(404).json({ error: 'Player not found' });
       const p = state.players.find(pl => pl.id === id);
       if (!p) return res.status(404).json({ error: 'Player not found' });
+      normalizePlayerAvatar(p);
       // return only minimal public information
       const out: any = { id: p.id, name: p.name, score: p.score };
       if ((p as any).avatarUrl) out.avatarUrl = (p as any).avatarUrl;
+      out.avatarFallback = p.avatarFallback;
       return res.json(out);
     } catch (err) {
       console.error('[PlayerValidate] failed', err);
@@ -78,7 +539,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Initialize or reset game
-  app.post("/api/game/init", async (req, res) => {
+  app.post("/api/game/init", runLocked(async (req, res) => {
     try {
       const bag: string[] = [];
       Object.entries(TILE_DISTRIBUTION).forEach(([letter, count]) => {
@@ -106,15 +567,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
         pausedAt: null
       };
 
+      bumpRevision(newGameState);
       await storage.saveGameState(newGameState);
+      normalizeGameStateAvatars(newGameState);
       res.json(newGameState);
     } catch (error) {
       res.status(500).json({ error: "Failed to initialize game" });
     }
-  });
+  }));
 
   // Join game
-  app.post("/api/game/join", async (req, res) => {
+  app.post("/api/game/join", runLocked(async (req, res) => {
     try {
       const { playerName, password } = req.body;
 
@@ -168,7 +631,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
 
         // Good: return existing player id and current game state
-        return res.json({ playerId: existing.id, gameState });
+        const signalingToken = issueVoiceToken(existing.id);
+        normalizeGameStateAvatars(gameState);
+        return res.json({ playerId: existing.id, gameState, signalingToken, signalingTokenTtlMs: VOICE_TOKEN_TTL_MS });
+      }
+
+      if (gameInProgress(gameState)) {
+        return res.status(409).json({ error: "Game already started. New players cannot join until lobby resets." });
       }
 
       // Create new player
@@ -188,26 +657,30 @@ export async function registerRoutes(app: Express): Promise<Server> {
       };
 
       gameState.players.push(newPlayer);
+      normalizeGameStateAvatars(gameState);
 
       // Save password for new player
       await storage.setPlayerPassword(playerId, password);
 
       // Do not auto-start or set current player here; game start is explicit
 
+      bumpRevision(gameState);
       await storage.saveGameState(gameState);
-      res.json({ playerId, gameState });
+      const signalingToken = issueVoiceToken(playerId);
+      res.json({ playerId, gameState, signalingToken, signalingTokenTtlMs: VOICE_TOKEN_TTL_MS });
     } catch (error) {
       res.status(500).json({ error: "Failed to join game" });
     }
-  });
+  }));
 
   // Leave game: remove player from current session; if last player leaves, reset session
-  app.post('/api/game/leave', async (req, res) => {
+  app.post('/api/game/leave', runLocked(async (req, res) => {
     try {
       const playerId = String(req.body?.playerId || '').trim();
       if (!playerId) return res.status(400).json({ error: 'playerId is required' });
 
       const state = await storage.getGameState();
+      normalizeGameStateAvatars(state);
       if (!state || !Array.isArray(state.players)) {
         return res.json({ success: true, gameState: state || null });
       }
@@ -216,6 +689,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (existingIndex === -1) {
         return res.json({ success: true, gameState: state });
       }
+
+      revokeVoiceToken(playerId);
 
       const wasCurrentPlayer = state.currentPlayer === playerId;
       state.players.splice(existingIndex, 1);
@@ -230,7 +705,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // If no players remain, terminate/reset session to empty initialized state
       if (state.players.length === 0) {
         const resetState = createEmptyGameState();
+        bumpRevision(resetState);
         await storage.saveGameState(resetState);
+        normalizeGameStateAvatars(resetState);
         return res.json({ success: true, gameState: resetState });
       }
 
@@ -245,16 +722,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
         state.turnStart = state.currentPlayer ? Date.now() : null;
       }
 
+      bumpRevision(state);
       await storage.saveGameState(state);
+      normalizeGameStateAvatars(state);
       return res.json({ success: true, gameState: state });
     } catch (err) {
       console.error('[Leave] failed', err);
       return res.status(500).json({ error: 'Failed to leave game' });
     }
-  });
+  }));
 
   // Update game state (for moves)
-  app.post("/api/game/update", async (req, res) => {
+  app.post("/api/game/update", runLocked(async (req, res) => {
     try {
       const updates = req.body;
       const result = gameStateSchema.safeParse(updates);
@@ -272,6 +751,43 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: 'Game has already ended' });
       }
       const incoming = result.data as GameState;
+
+      if (previous) {
+        const incomingRevision = typeof incoming.revision === 'number' ? incoming.revision : -1;
+        const currentRevision = stateRevision(previous);
+        if (incomingRevision !== currentRevision) {
+          return res.status(409).json({
+            error: 'State is stale. Refresh and retry.',
+            currentRevision,
+          });
+        }
+
+        if ((incoming.turn || 0) < (previous.turn || 0)) {
+          return res.status(409).json({ error: 'State is stale. Turn cannot move backwards.' });
+        }
+
+        const previousInProgress = gameInProgress(previous);
+        const incomingInProgress = gameInProgress(incoming);
+        if (!previousInProgress && incomingInProgress) {
+          return res.status(400).json({ error: 'Lobby-to-game transition must use /api/game/start.' });
+        }
+        if (previousInProgress && !incomingInProgress && !incoming.gameEnded) {
+          return res.status(400).json({ error: 'Game-to-lobby transition must use reset/init flow, not /api/game/update.' });
+        }
+
+        if (incoming.currentPlayer && !(incoming.players || []).some((p) => p.id === incoming.currentPlayer)) {
+          return res.status(400).json({ error: 'currentPlayer must reference an existing player.' });
+        }
+        if (!incoming.currentPlayer && (incoming.turn || 0) > 0 && !incoming.gameEnded) {
+          return res.status(400).json({ error: 'Active turns require a currentPlayer.' });
+        }
+
+        const previousPlayerIds = (previous.players || []).map((p) => p.id).sort().join('|');
+        const incomingPlayerIds = (incoming.players || []).map((p) => p.id).sort().join('|');
+        if (previousPlayerIds !== incomingPlayerIds) {
+          return res.status(400).json({ error: 'Player roster changes must use join/leave endpoints.' });
+        }
+      }
 
       // If there are more moves in the incoming state, inspect the last move
       const prevMoves = previous?.moves?.length || 0;
@@ -332,6 +848,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // minus tiles currently on board and tiles in players' racks, then
       // rebuild and shuffle the bag accordingly.
       const incomingState = result.data as GameState;
+      normalizeGameStateAvatars(incomingState);
       // Adjust server-authoritative timestamps and pause transitions.
       try {
         if (previous) {
@@ -509,10 +1026,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         console.error('[TileBag Reconcile] failed', err);
       }
 
+      bumpRevision(incomingState);
       await storage.saveGameState(incomingState);
 
       // Verify save worked
       const saved = await storage.getGameState();
+      normalizeGameStateAvatars(saved);
       console.log("Game state saved. Board center:", saved?.board[7]?.slice(6, 10));
 
       if (!saved) {
@@ -526,6 +1045,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         saved.gameEnded = true;
         saved.winnerId = endCheck.winnerId;
         saved.endReason = endCheck.reason;
+        bumpRevision(saved);
         await storage.saveGameState(saved);
       }
 
@@ -534,7 +1054,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.error("Failed to update game state:", error);
       res.status(500).json({ error: "Failed to update game state" });
     }
-  });
+  }));
 
   // Validate word with Wiktionary or word file
   // Serve the local word list as plain text (one word per line)
@@ -562,52 +1082,113 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!playerId) return res.status(400).json({ error: 'playerId required' });
       const state = await storage.getGameState();
       if (!state) return res.status(404).json({ error: 'No game state' });
+
+      const auth = await authorizePlayerStatsRead(req, state);
+      if (!auth.allowed) {
+        return res.status(auth.status).json({ error: auth.error });
+      }
+
       const p = state.players.find(x => x.id === playerId);
       if (!p) return res.status(404).json({ error: 'Player not found' });
 
-      // Currently we only have per-game score info server-side. Return a
-      // minimal cached snapshot. Later this can be replaced by a persistent
-      // stats store that aggregates across games.
-      const snapshot = {
-        playerId: p.id,
-        score: p.score || 0,
-        wins: 0,
-        losses: 0,
-        games: 1,
-        cachedAt: Date.now(),
-        source: 'server-snapshot'
-      };
-      return res.json(snapshot);
+      const now = Date.now();
+      const revision = stateRevision(state);
+      cleanupPlayerStatsCache(state, now, revision);
+      const cached = playerStatsCache.get(p.id);
+
+      const scoreNow = Number(p.score) || 0;
+      let missReason = 'none';
+      if (!cached) missReason = 'cold-start';
+      else if (!hasValidStatsMetadata(cached, now)) missReason = 'invalid-metadata';
+      else if (cached.playerId !== p.id) missReason = 'player-mismatch';
+      else if (cached.score !== scoreNow) missReason = 'score-drift';
+      else if (cached.stateRevision !== revision) missReason = 'revision-drift';
+      else if (now >= cached.expiresAt) missReason = 'expired';
+
+      const canUseCached = !!cached
+        && hasValidStatsMetadata(cached, now)
+        && cached.playerId === p.id
+        && cached.score === scoreNow
+        && cached.stateRevision === revision
+        && now < cached.expiresAt;
+
+      const entry = canUseCached
+        ? (cached as CachedStatsEntry)
+        : buildStatsCacheEntry(p, revision, now);
+
+      if (!canUseCached) {
+        playerStatsCache.set(p.id, entry);
+      }
+
+      let response = buildStatsResponse(entry, now);
+      if (!isStatsResponseConsistent(response, now)) {
+        const repaired = buildStatsCacheEntry(p, revision, now);
+        playerStatsCache.set(p.id, repaired);
+        response = buildStatsResponse(repaired, now);
+        logPlayerStatsCacheEvent(p.id, {
+          event: 'repair',
+          reason: 'response-inconsistent',
+          cacheStatus: response.cacheStatus,
+          revision,
+          score: scoreNow,
+          ageMs: response.ageMs,
+          authMode: auth.mode,
+        });
+      } else {
+        logPlayerStatsCacheEvent(p.id, {
+          event: canUseCached ? 'hit' : 'miss',
+          reason: canUseCached ? 'reuse-valid' : missReason,
+          cacheStatus: response.cacheStatus,
+          revision,
+          score: scoreNow,
+          ageMs: response.ageMs,
+          authMode: auth.mode,
+        });
+      }
+
+      return res.json(response);
     } catch (err) {
       console.error('[PlayerStats] failed', err);
       return res.status(500).json({ error: 'Failed to get player stats' });
     }
   });
 
-  // Set or update a player's avatar URL (basic validation)
-  app.post('/api/player/:playerId/avatar', async (req, res) => {
+  // Set or update a player's avatar URL (strict validation + deterministic fallback data)
+  app.post('/api/player/:playerId/avatar', runLocked(async (req, res) => {
     try {
       const playerId = String(req.params.playerId || '');
       const { avatarUrl } = req.body || {};
       if (!playerId) return res.status(400).json({ error: 'playerId required' });
-      if (!avatarUrl || typeof avatarUrl !== 'string') return res.status(400).json({ error: 'avatarUrl required' });
-
-      // Basic validation: must be http(s) and reasonably short
-      if (!/^https?:\/\//i.test(avatarUrl) || avatarUrl.length > 200) return res.status(400).json({ error: 'Invalid avatarUrl' });
+      if (avatarUrl !== null && avatarUrl !== undefined && typeof avatarUrl !== 'string') {
+        return res.status(400).json({ error: 'avatarUrl must be a string' });
+      }
 
       const state = await storage.getGameState();
       if (!state) return res.status(404).json({ error: 'No game state' });
       const p = state.players.find(x => x.id === playerId);
       if (!p) return res.status(404).json({ error: 'Player not found' });
 
-      p.avatarUrl = avatarUrl;
+      const normalized = sanitizeAvatarUrlInput(avatarUrl);
+      if (normalized.error) {
+        return res.status(400).json({
+          error: 'Invalid avatarUrl',
+          details: normalized.error,
+          avatarFallback: buildAvatarFallback(p),
+        });
+      }
+
+      if (normalized.avatarUrl) p.avatarUrl = normalized.avatarUrl;
+      else delete (p as any).avatarUrl;
+      p.avatarFallback = buildAvatarFallback(p);
+
+      bumpRevision(state);
       await storage.saveGameState(state);
-      return res.json({ success: true, avatarUrl });
+      return res.json({ success: true, avatarUrl: p.avatarUrl || null, avatarFallback: p.avatarFallback });
     } catch (err) {
       console.error('[Avatar] failed', err);
       return res.status(500).json({ error: 'Failed to set avatar' });
     }
-  });
+  }));
 
   app.get("/api/validate-word/:word", async (req, res) => {
     try {
@@ -651,7 +1232,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Receive preview placements from the active player (non-authoritative preview only)
-  app.post('/api/game/preview', async (req, res) => {
+  app.post('/api/game/preview', runLocked(async (req, res) => {
     try {
       const { playerId, placedTiles } = req.body || {};
       if (!playerId || !Array.isArray(placedTiles)) {
@@ -666,14 +1247,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // sanitize placed tiles (row/col/letter)
       state.previews[playerId] = placedTiles.map((t: any) => ({ row: Number(t.row), col: Number(t.col), letter: String(t.letter), blank: !!t.blank }));
 
+      bumpRevision(state);
       await storage.saveGameState(state);
       const saved = await storage.getGameState();
+      normalizeGameStateAvatars(saved);
       return res.json({ success: true, gameState: saved });
     } catch (err) {
       console.error('[Preview] failed', err);
       return res.status(500).json({ error: 'Failed to save preview' });
     }
-  });
+  }));
 
   // Provide ICE server configuration to clients. This allows the client
   // to use a locally-hosted TURN server if environment variables are set.
@@ -717,11 +1300,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Start game: shuffle player order, build tile bag, deal racks, and set initial turn
-  app.post('/api/game/start', async (req, res) => {
+  app.post('/api/game/start', runLocked(async (req, res) => {
     try {
       const state = await storage.getGameState();
       if (!state) return res.status(400).json({ error: 'No game to start' });
       if (!Array.isArray(state.players) || state.players.length === 0) return res.status(400).json({ error: 'No players to start game' });
+      if (gameInProgress(state)) return res.status(409).json({ error: 'Game already started' });
 
       // Enforce readiness: all players in lobby must be marked ready.
       const notReadyPlayers = state.players.filter((p) => !p.ready).map((p) => p.name);
@@ -765,19 +1349,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
       state.turn = 1;
       state.turnStart = Date.now();
       state.paused = false;
+      state.pausedBy = null;
       state.pausedAt = null;
       state.gameEnded = false;
       state.winnerId = undefined;
       state.endReason = undefined;
+      state.previews = {};
 
+      bumpRevision(state);
       await storage.saveGameState(state);
       const saved = await storage.getGameState();
+      normalizeGameStateAvatars(saved);
       return res.json({ success: true, gameState: saved });
     } catch (err) {
       console.error('[Start] failed', err);
       return res.status(500).json({ error: 'Failed to start game' });
     }
-  });
+  }));
 
   // Health check for TURN server reachability (useful for CI)
   app.get('/api/turn-health', async (req, res) => {
@@ -809,18 +1397,129 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
     console.log('[WebSocket] server listening on /ws');
 
-    type ClientRecord = { ws: WebSocket, lastSeen: number };
+    type RateBucket = { startedAt: number; count: number };
+    type ClientRecord = {
+      ws: WebSocket,
+      lastSeen: number,
+      playerId: string,
+      ip: string,
+      totalBucket: RateBucket,
+      sdpBucket: RateBucket,
+      candidateBucket: RateBucket,
+    };
     const clients = new Map<string, ClientRecord>();
 
     const WS_HEARTBEAT_INTERVAL = parseInt(process.env.WS_HEARTBEAT_MS || '30000', 10);
     const WS_STALE_MS = parseInt(process.env.WS_STALE_MS || '60000', 10);
+    const WS_MAX_MESSAGE_BYTES = parseInt(process.env.WS_MAX_MESSAGE_BYTES || '65536', 10);
+    const SIGNAL_WINDOW_MS = parseInt(process.env.VOICE_SIGNAL_WINDOW_MS || '5000', 10);
+    const SIGNAL_MAX_TOTAL = parseInt(process.env.VOICE_SIGNAL_MAX_TOTAL || '60', 10);
+    const SIGNAL_MAX_SDP = parseInt(process.env.VOICE_SIGNAL_MAX_SDP || '20', 10);
+    const SIGNAL_MAX_CANDIDATE = parseInt(process.env.VOICE_SIGNAL_MAX_CANDIDATE || '40', 10);
+    const WS_MAX_PLAYER_ID_CHARS = parseInt(process.env.WS_MAX_PLAYER_ID_CHARS || '128', 10);
+    const WS_MAX_SDP_CHARS = parseInt(process.env.WS_MAX_SDP_CHARS || '32768', 10);
+    const WS_MAX_CANDIDATE_CHARS = parseInt(process.env.WS_MAX_CANDIDATE_CHARS || '8192', 10);
+    const WS_MAX_SDP_MID_CHARS = parseInt(process.env.WS_MAX_SDP_MID_CHARS || '128', 10);
 
     // expose basic health info globally for the /api/ws-health route
     (global as any).__wsHealth = { connected: 0, peers: [] };
 
+    const refreshHealth = () => {
+      (global as any).__wsHealth.connected = clients.size;
+      (global as any).__wsHealth.peers = Array.from(clients.keys()).map(id => ({ id, lastSeen: clients.get(id)!.lastSeen }));
+    };
+
+    const windowAllow = (bucket: RateBucket, limit: number): boolean => {
+      const now = Date.now();
+      if (now - bucket.startedAt > SIGNAL_WINDOW_MS) {
+        bucket.startedAt = now;
+        bucket.count = 0;
+      }
+      bucket.count += 1;
+      return bucket.count <= limit;
+    };
+
+    const allowSignalMessage = (rec: ClientRecord, type: string): boolean => {
+      if (!windowAllow(rec.totalBucket, SIGNAL_MAX_TOTAL)) return false;
+      if (type === 'candidate') {
+        return windowAllow(rec.candidateBucket, SIGNAL_MAX_CANDIDATE);
+      }
+      return windowAllow(rec.sdpBucket, SIGNAL_MAX_SDP);
+    };
+
+    const isValidPlayerRef = (value: unknown): value is string => {
+      if (typeof value !== 'string') return false;
+      const trimmed = value.trim();
+      if (!trimmed || trimmed.length > WS_MAX_PLAYER_ID_CHARS) return false;
+      if(/[\u0000-\u001F\u007F]/.test(trimmed)) return false;
+      return true;
+    };
+
+    const isObjectLike = (value: unknown): value is Record<string, unknown> => {
+      return !!value && typeof value === 'object' && !Array.isArray(value);
+    };
+
+    const hasValidSdpPayload = (value: unknown, expectedType: 'offer' | 'answer'): boolean => {
+      if (!isObjectLike(value)) return false;
+      const sdpType = value.type;
+      const sdp = value.sdp;
+      if (sdpType !== expectedType) return false;
+      if (typeof sdp !== 'string' || !sdp.trim() || sdp.length > WS_MAX_SDP_CHARS) return false;
+      return true;
+    };
+
+    const hasValidCandidatePayload = (value: unknown): boolean => {
+      if (value === null) return true;
+      if (!isObjectLike(value)) return false;
+
+      const cand = value.candidate;
+      if (typeof cand !== 'string' || !cand.trim() || cand.length > WS_MAX_CANDIDATE_CHARS) return false;
+
+      const sdpMid = value.sdpMid;
+      if (sdpMid !== undefined && sdpMid !== null) {
+        if (typeof sdpMid !== 'string' || sdpMid.length > WS_MAX_SDP_MID_CHARS) return false;
+      }
+
+      const sdpMLineIndex = value.sdpMLineIndex;
+      if (sdpMLineIndex !== undefined && sdpMLineIndex !== null) {
+        if (!Number.isInteger(sdpMLineIndex) || sdpMLineIndex < 0 || sdpMLineIndex > 65535) return false;
+      }
+
+      return true;
+    };
+
+    const isParticipant = async (playerId: string): Promise<boolean> => {
+      const state = await storage.getGameState();
+      if (!state || !Array.isArray(state.players)) return false;
+      return state.players.some((p) => p.id === playerId);
+    };
+
+    const isSignalRoomSafe = async (fromPlayerId: string, toPlayerId: string): Promise<boolean> => {
+      if (!fromPlayerId || !toPlayerId) return false;
+      const state = await storage.getGameState();
+      if (!state || !Array.isArray(state.players)) return false;
+      const ids = new Set((state.players || []).map((p) => p.id));
+      return ids.has(fromPlayerId) && ids.has(toPlayerId);
+    };
+
+    const removeClientAndNotify = (playerId: string) => {
+      if (!playerId || !clients.has(playerId)) return;
+      clients.delete(playerId);
+      for (const id of Array.from(clients.keys())) {
+        const cws = clients.get(id)!.ws;
+        try {
+          cws.send(JSON.stringify({ type: 'peer-left', playerId }));
+        } catch (err) {
+          console.warn('[WebSocket] failed to notify peer-left to', id, err);
+        }
+      }
+      refreshHealth();
+    };
+
     wss.on('connection', (ws: WebSocket, req) => {
       console.log('[WebSocket] connection established', req.socket.remoteAddress);
       let registeredId: string | null = null;
+      const remoteIp = String(req.socket.remoteAddress || req.headers['x-forwarded-for'] || 'unknown');
 
       // Update lastSeen on pong
       ws.on('pong', () => {
@@ -830,19 +1529,64 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
       });
 
-      ws.on('message', (raw) => {
+      ws.on('message', async (raw) => {
         try {
+          const rawBytes = typeof raw === 'string' ? Buffer.byteLength(raw) : (raw as Buffer).byteLength;
+          if (rawBytes > WS_MAX_MESSAGE_BYTES) {
+            console.warn('[WebSocket] oversized message dropped', { ip: remoteIp, bytes: rawBytes });
+            try { ws.close(1009, 'Message too large'); } catch (e) {}
+            return;
+          }
+
           const msg = JSON.parse(raw.toString());
           const type = msg.type;
+
+          if (type === 'ws-ping') {
+            if (registeredId) {
+              const rec = clients.get(registeredId);
+              if (rec) rec.lastSeen = Date.now();
+            }
+            return;
+          }
+
           if (type === 'join') {
             const playerId = String(msg.playerId || '');
-            if (!playerId) return;
-            registeredId = playerId;
-            clients.set(playerId, { ws, lastSeen: Date.now() });
+            const signalingToken = String(msg.signalingToken || '');
+            if (!playerId || !signalingToken) {
+              try { ws.close(1008, 'Auth required'); } catch (e) {}
+              return;
+            }
+            pruneExpiredVoiceTokens();
+            if (!verifyVoiceToken(playerId, signalingToken)) {
+              console.warn('[WebSocket] join rejected invalid signaling token', { playerId, ip: remoteIp });
+              try { ws.close(1008, 'Unauthorized'); } catch (e) {}
+              return;
+            }
+            const participant = await isParticipant(playerId);
+            if (!participant) {
+              console.warn('[WebSocket] join rejected non-participant', { playerId, ip: remoteIp });
+              try { ws.close(1008, 'Forbidden'); } catch (e) {}
+              return;
+            }
 
-            // update health
-            (global as any).__wsHealth.connected = clients.size;
-            (global as any).__wsHealth.peers = Array.from(clients.keys()).map(id => ({ id, lastSeen: clients.get(id)!.lastSeen }));
+            const previous = clients.get(playerId);
+            if (previous && previous.ws !== ws) {
+              try { previous.ws.close(1000, 'Replaced by newer session'); } catch (e) {}
+              clients.delete(playerId);
+            }
+
+            registeredId = playerId;
+            const now = Date.now();
+            clients.set(playerId, {
+              ws,
+              playerId,
+              ip: remoteIp,
+              lastSeen: now,
+              totalBucket: { startedAt: now, count: 0 },
+              sdpBucket: { startedAt: now, count: 0 },
+              candidateBucket: { startedAt: now, count: 0 },
+            });
+            refreshHealth();
 
             // inform the joining client of current peers
             const peers = Array.from(clients.keys()).filter(id => id !== playerId);
@@ -861,14 +1605,75 @@ export async function registerRoutes(app: Express): Promise<Server> {
               }
             }
           } else if (type === 'offer' || type === 'answer' || type === 'candidate') {
-            const to = String(msg.to || '');
-            if (!to) return;
+            if (!registeredId) {
+              try { ws.close(1008, 'Join required'); } catch (e) {}
+              return;
+            }
+
+            if (msg.from !== undefined && String(msg.from) !== registeredId) {
+              console.warn('[WebSocket] signaling payload sender mismatch', {
+                registeredId,
+                payloadFrom: msg.from,
+                type,
+                ip: remoteIp,
+              });
+              return;
+            }
+
+            const senderRec = clients.get(registeredId);
+            if (!senderRec) {
+              try { ws.close(1008, 'Session invalid'); } catch (e) {}
+              return;
+            }
+            if (!allowSignalMessage(senderRec, type)) {
+              console.warn('[WebSocket] rate-limited signaling message', { playerId: registeredId, type, ip: senderRec.ip });
+              try { ws.send(JSON.stringify({ type: 'error', code: 'RATE_LIMITED', message: 'Too many signaling messages' })); } catch (e) {}
+              return;
+            }
+
+            if (!isValidPlayerRef(msg.to)) {
+              console.warn('[WebSocket] invalid signaling target dropped', { playerId: registeredId, type, ip: senderRec.ip });
+              return;
+            }
+            const to = msg.to.trim();
+
+            if (to === registeredId) {
+              console.warn('[WebSocket] self-targeted signaling blocked', { playerId: registeredId, type });
+              return;
+            }
+
+            if (type === 'offer' && !hasValidSdpPayload(msg.offer, 'offer')) {
+              console.warn('[WebSocket] invalid offer payload dropped', { from: registeredId, to, ip: senderRec.ip });
+              return;
+            }
+            if (type === 'answer' && !hasValidSdpPayload(msg.answer, 'answer')) {
+              console.warn('[WebSocket] invalid answer payload dropped', { from: registeredId, to, ip: senderRec.ip });
+              return;
+            }
+            if (type === 'candidate' && !hasValidCandidatePayload(msg.candidate)) {
+              console.warn('[WebSocket] invalid candidate payload dropped', { from: registeredId, to, ip: senderRec.ip });
+              return;
+            }
+
+            const safeRoom = await isSignalRoomSafe(registeredId, to);
+            if (!safeRoom) {
+              console.warn('[WebSocket] blocked signaling outside active room', { from: registeredId, to, type });
+              return;
+            }
+
             const targetRec = clients.get(to);
-            console.log('[WebSocket] forwarding', type, 'from', msg.from, 'to', to);
+            console.log('[WebSocket] forwarding', type, 'from', registeredId, 'to', to);
             if (targetRec) {
               try {
                 if (targetRec.ws.readyState === WebSocket.OPEN) {
-                  targetRec.ws.send(JSON.stringify(msg));
+                  // Prevent sender spoofing by rewriting the authoritative sender id.
+                  const forwarded = {
+                    ...msg,
+                    from: registeredId,
+                    to,
+                    type,
+                  };
+                  targetRec.ws.send(JSON.stringify(forwarded));
                 } else {
                   console.warn('[WebSocket] target not open for', to, 'state=', targetRec.ws.readyState);
                 }
@@ -879,44 +1684,34 @@ export async function registerRoutes(app: Express): Promise<Server> {
               console.warn('[WebSocket] no target client found for', to);
             }
           } else if (type === 'leave') {
-            const pid = String(msg.playerId || '');
-            if (pid && clients.has(pid)) {
-              clients.delete(pid);
-              // notify others
-              console.log('[WebSocket] player left', pid);
-              for (const id of Array.from(clients.keys())) {
-                const crec = clients.get(id)!.ws;
-                try {
-                  crec.send(JSON.stringify({ type: 'peer-left', playerId: pid }));
-                } catch (err) {
-                  console.warn('[WebSocket] failed to notify peer-left to', id, err);
-                }
-              }
-              (global as any).__wsHealth.connected = clients.size;
-              (global as any).__wsHealth.peers = Array.from(clients.keys()).map(id => ({ id, lastSeen: clients.get(id)!.lastSeen }));
+            const pid = registeredId || String(msg.playerId || '');
+            if (registeredId && msg.playerId && String(msg.playerId) !== registeredId) {
+              console.warn('[WebSocket] leave payload player mismatch', { payloadPlayerId: msg.playerId, registeredId, ip: remoteIp });
+              return;
             }
+            if (pid && clients.has(pid)) {
+              console.log('[WebSocket] player left', pid);
+              removeClientAndNotify(pid);
+            }
+          } else {
+            console.warn('[WebSocket] unknown message type dropped', { type, ip: remoteIp });
           }
         } catch (err) {
-          // ignore malformed messages
+          console.warn('[WebSocket] malformed message dropped', { ip: remoteIp, err: String(err) });
         }
       });
 
       ws.on('close', () => {
         if (registeredId && clients.has(registeredId)) {
-          clients.delete(registeredId);
-          for (const id of Array.from(clients.keys())) {
-            const cws = clients.get(id)!.ws;
-            try { cws.send(JSON.stringify({ type: 'peer-left', playerId: registeredId })); } catch (err) {}
-          }
-          (global as any).__wsHealth.connected = clients.size;
-          (global as any).__wsHealth.peers = Array.from(clients.keys()).map(id => ({ id, lastSeen: clients.get(id)!.lastSeen }));
+          removeClientAndNotify(registeredId);
         }
       });
     });
 
     // Heartbeat interval: send pings and clean up stale peers
-    setInterval(() => {
+    const heartbeatTimer = setInterval(() => {
       try {
+        pruneExpiredVoiceTokens();
         const now = Date.now();
         for (const [id, rec] of Array.from(clients.entries())) {
           try {
@@ -938,12 +1733,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
             }
           }
         }
-        (global as any).__wsHealth.connected = clients.size;
-        (global as any).__wsHealth.peers = Array.from(clients.keys()).map(id => ({ id, lastSeen: clients.get(id)!.lastSeen }));
+        refreshHealth();
       } catch (e) {
         // ignore heartbeat errors
       }
     }, WS_HEARTBEAT_INTERVAL);
+    if (typeof (heartbeatTimer as any).unref === 'function') {
+      (heartbeatTimer as any).unref();
+    }
   } catch (err) {
     console.error('[WebSocket] failed to start signaling server', err);
   }
