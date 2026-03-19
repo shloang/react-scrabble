@@ -92,6 +92,9 @@ export interface GameState {
   turnStart?: number | null;
   // When the game was paused (ms since epoch) or null when not paused
   pausedAt?: number | null;
+  // Session lifecycle timestamps for stale-session cleanup.
+  sessionCreatedAt?: number | null;
+  lastActivityAt?: number | null;
 }
 
 export const playerSchema = z.object({
@@ -148,6 +151,8 @@ export const gameStateSchema = z.object({
   pausedBy: z.string().nullable().optional(),
   turnStart: z.number().nullable().optional(),
   pausedAt: z.number().nullable().optional(),
+  sessionCreatedAt: z.number().nullable().optional(),
+  lastActivityAt: z.number().nullable().optional(),
 });
 
 export type InsertPlayer = Omit<Player, 'id'>;

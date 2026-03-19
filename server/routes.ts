@@ -84,6 +84,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       90 * 24 * 60 * 60 * 1000,
     ),
   );
+  const SESSION_STALE_MS = 24 * 60 * 60 * 1000;
 
   function tokenHash(value: string): string {
     return createHash('sha256').update(value).digest('hex');
@@ -448,6 +449,59 @@ export async function registerRoutes(app: Express): Promise<Server> {
     return true;
   }
 
+  function stateEvidenceLastActivityAt(state?: GameState | null): number | null {
+    if (!state) return null;
+    const candidates: number[] = [];
+    if (Number.isFinite(state.lastActivityAt)) candidates.push(Number(state.lastActivityAt));
+    if (Number.isFinite(state.turnStart)) candidates.push(Number(state.turnStart));
+    if (Number.isFinite(state.pausedAt)) candidates.push(Number(state.pausedAt));
+    if (Array.isArray(state.moves)) {
+      for (const mv of state.moves) {
+        if (Number.isFinite(mv?.timestamp)) candidates.push(Number(mv.timestamp));
+      }
+    }
+    if (!candidates.length) return null;
+    return Math.max(...candidates);
+  }
+
+  function touchStateActivity(state: GameState, now = Date.now()): GameState {
+    if (!Number.isFinite(state.sessionCreatedAt)) {
+      state.sessionCreatedAt = now;
+    }
+    state.lastActivityAt = now;
+    return state;
+  }
+
+  async function loadActiveStateWithExpiry(): Promise<{ state: GameState | undefined; expired: boolean }> {
+    let state = await storage.getGameState();
+    if (!state) return { state: undefined, expired: false };
+
+    const now = Date.now();
+    const lastActivity = stateEvidenceLastActivityAt(state);
+    if (Number.isFinite(lastActivity) && (now - Number(lastActivity)) >= SESSION_STALE_MS) {
+      const resetState = touchStateActivity(createEmptyGameState(), now);
+      bumpRevision(resetState);
+      await storage.saveGameState(resetState);
+      return { state: resetState, expired: true };
+    }
+
+    // Backfill timestamps for old states so expiration works consistently.
+    let changed = false;
+    if (!Number.isFinite(state.sessionCreatedAt)) {
+      state.sessionCreatedAt = Number.isFinite(lastActivity) ? Number(lastActivity) : now;
+      changed = true;
+    }
+    if (!Number.isFinite(state.lastActivityAt)) {
+      state.lastActivityAt = Number.isFinite(lastActivity) ? Number(lastActivity) : now;
+      changed = true;
+    }
+    if (changed) {
+      await storage.saveGameState(state);
+    }
+
+    return { state, expired: false };
+  }
+
   function cleanupPlayerStatsCache(state: GameState, now: number, revision: number) {
     const playersById = new Map((state.players || []).map((pl) => [pl.id, pl]));
 
@@ -475,6 +529,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   }
 
   function createEmptyGameState(): GameState {
+    const now = Date.now();
     const bag: string[] = [];
     Object.entries(TILE_DISTRIBUTION).forEach(([letter, count]) => {
       for (let i = 0; i < count; i++) {
@@ -499,6 +554,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       pausedBy: null,
       turnStart: null,
       pausedAt: null,
+      sessionCreatedAt: now,
+      lastActivityAt: now,
       gameEnded: false,
       winnerId: undefined,
       endReason: undefined,
@@ -509,7 +566,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Get current game state
   app.get("/api/game", async (req, res) => {
     try {
-      const gameState = await storage.getGameState();
+      const { state: gameState } = await loadActiveStateWithExpiry();
       normalizeGameStateAvatars(gameState);
       res.json(gameState || null);
     } catch (error) {
@@ -522,7 +579,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const id = String(req.params.id || '');
       if (!id || typeof id !== 'string') return res.status(400).json({ error: 'Invalid player id' });
-      const state = await storage.getGameState();
+      const { state } = await loadActiveStateWithExpiry();
       if (!state || !Array.isArray(state.players)) return res.status(404).json({ error: 'Player not found' });
       const p = state.players.find(pl => pl.id === id);
       if (!p) return res.status(404).json({ error: 'Player not found' });
@@ -564,9 +621,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         , paused: false,
         pausedBy: null,
         turnStart: null,
-        pausedAt: null
+        pausedAt: null,
+        sessionCreatedAt: Date.now(),
+        lastActivityAt: Date.now(),
       };
 
+      touchStateActivity(newGameState);
       bumpRevision(newGameState);
       await storage.saveGameState(newGameState);
       normalizeGameStateAvatars(newGameState);
@@ -589,7 +649,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "Password is required" });
       }
 
-      let gameState = await storage.getGameState();
+      let { state: gameState } = await loadActiveStateWithExpiry();
       
       // Initialize game if it doesn't exist
       if (!gameState) {
@@ -615,7 +675,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
           , paused: false,
           pausedBy: null,
           turnStart: null,
-          pausedAt: null
+          pausedAt: null,
+          sessionCreatedAt: Date.now(),
+          lastActivityAt: Date.now(),
         };
       }
 
@@ -664,6 +726,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Do not auto-start or set current player here; game start is explicit
 
+      touchStateActivity(gameState);
       bumpRevision(gameState);
       await storage.saveGameState(gameState);
       const signalingToken = issueVoiceToken(playerId);
@@ -679,7 +742,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const playerId = String(req.body?.playerId || '').trim();
       if (!playerId) return res.status(400).json({ error: 'playerId is required' });
 
-      const state = await storage.getGameState();
+      const { state } = await loadActiveStateWithExpiry();
       normalizeGameStateAvatars(state);
       if (!state || !Array.isArray(state.players)) {
         return res.json({ success: true, gameState: state || null });
@@ -704,7 +767,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // If no players remain, terminate/reset session to empty initialized state
       if (state.players.length === 0) {
-        const resetState = createEmptyGameState();
+        const resetState = touchStateActivity(createEmptyGameState());
         bumpRevision(resetState);
         await storage.saveGameState(resetState);
         normalizeGameStateAvatars(resetState);
@@ -722,6 +785,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         state.turnStart = state.currentPlayer ? Date.now() : null;
       }
 
+      touchStateActivity(state);
       bumpRevision(state);
       await storage.saveGameState(state);
       normalizeGameStateAvatars(state);
@@ -729,6 +793,32 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (err) {
       console.error('[Leave] failed', err);
       return res.status(500).json({ error: 'Failed to leave game' });
+    }
+  }));
+
+  // Host-only manual session reset: clears all lobby/game presence and starts a fresh session.
+  app.post('/api/game/reset-session', runLocked(async (req, res) => {
+    try {
+      const requesterId = String(req.body?.requesterId || '').trim();
+      if (!requesterId) return res.status(400).json({ error: 'requesterId is required' });
+
+      const { state } = await loadActiveStateWithExpiry();
+      if (state && Array.isArray(state.players) && state.players.length > 0) {
+        const hostId = state.players[0]?.id;
+        if (!hostId || hostId !== requesterId) {
+          return res.status(403).json({ error: 'Only lobby host can reset session' });
+        }
+        for (const p of state.players) revokeVoiceToken(p.id);
+      }
+
+      const resetState = touchStateActivity(createEmptyGameState());
+      bumpRevision(resetState);
+      await storage.saveGameState(resetState);
+      normalizeGameStateAvatars(resetState);
+      return res.json({ success: true, gameState: resetState });
+    } catch (err) {
+      console.error('[ResetSession] failed', err);
+      return res.status(500).json({ error: 'Failed to reset session' });
     }
   }));
 
@@ -744,7 +834,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // If there is an existing saved state, perform scoring validation
-      const previous = await storage.getGameState();
+      const { state: previous } = await loadActiveStateWithExpiry();
       // Enforce server-side: reject updates if the saved game already ended
       if (previous && previous.gameEnded) {
         console.warn('[Update] rejected update: game already ended');
@@ -1026,11 +1116,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         console.error('[TileBag Reconcile] failed', err);
       }
 
+      touchStateActivity(incomingState);
       bumpRevision(incomingState);
       await storage.saveGameState(incomingState);
 
       // Verify save worked
-      const saved = await storage.getGameState();
+      const { state: saved } = await loadActiveStateWithExpiry();
       normalizeGameStateAvatars(saved);
       console.log("Game state saved. Board center:", saved?.board[7]?.slice(6, 10));
 
@@ -1080,7 +1171,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const playerId = String(req.params.playerId || '');
       if (!playerId) return res.status(400).json({ error: 'playerId required' });
-      const state = await storage.getGameState();
+      const { state } = await loadActiveStateWithExpiry();
       if (!state) return res.status(404).json({ error: 'No game state' });
 
       const auth = await authorizePlayerStatsRead(req, state);
@@ -1181,6 +1272,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       else delete (p as any).avatarUrl;
       p.avatarFallback = buildAvatarFallback(p);
 
+      touchStateActivity(state);
       bumpRevision(state);
       await storage.saveGameState(state);
       return res.json({ success: true, avatarUrl: p.avatarUrl || null, avatarFallback: p.avatarFallback });
@@ -1239,19 +1331,32 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: 'Invalid preview payload' });
       }
 
-      const state = await storage.getGameState();
+      const { state } = await loadActiveStateWithExpiry();
       if (!state) return res.status(500).json({ error: 'No game state' });
 
       // attach previews map on state
       state.previews = state.previews || {};
       // sanitize placed tiles (row/col/letter)
-      state.previews[playerId] = placedTiles.map((t: any) => ({ row: Number(t.row), col: Number(t.col), letter: String(t.letter), blank: !!t.blank }));
+      const sanitized = placedTiles.map((t: any) => ({ row: Number(t.row), col: Number(t.col), letter: String(t.letter), blank: !!t.blank }));
+      const previousPreview = Array.isArray((state.previews as any)[playerId]) ? (state.previews as any)[playerId] : [];
+      const changed = JSON.stringify(previousPreview) !== JSON.stringify(sanitized);
 
-      bumpRevision(state);
+      if (!changed) {
+        normalizeGameStateAvatars(state);
+        return res.json({ success: true, gameState: state });
+      }
+
+      if (sanitized.length > 0) {
+        state.previews[playerId] = sanitized;
+      } else {
+        delete (state.previews as any)[playerId];
+      }
+
+      // Preview changes are non-authoritative and should not bump revision.
+      touchStateActivity(state);
       await storage.saveGameState(state);
-      const saved = await storage.getGameState();
-      normalizeGameStateAvatars(saved);
-      return res.json({ success: true, gameState: saved });
+      normalizeGameStateAvatars(state);
+      return res.json({ success: true, gameState: state });
     } catch (err) {
       console.error('[Preview] failed', err);
       return res.status(500).json({ error: 'Failed to save preview' });
@@ -1302,7 +1407,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Start game: shuffle player order, build tile bag, deal racks, and set initial turn
   app.post('/api/game/start', runLocked(async (req, res) => {
     try {
-      const state = await storage.getGameState();
+      const { state } = await loadActiveStateWithExpiry();
       if (!state) return res.status(400).json({ error: 'No game to start' });
       if (!Array.isArray(state.players) || state.players.length === 0) return res.status(400).json({ error: 'No players to start game' });
       if (gameInProgress(state)) return res.status(409).json({ error: 'Game already started' });
@@ -1348,17 +1453,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
       state.currentPlayer = state.players[0].id;
       state.turn = 1;
       state.turnStart = Date.now();
-      state.paused = false;
+      state.paused = true;
       state.pausedBy = null;
-      state.pausedAt = null;
+      state.pausedAt = Date.now();
       state.gameEnded = false;
       state.winnerId = undefined;
       state.endReason = undefined;
       state.previews = {};
 
+      touchStateActivity(state);
       bumpRevision(state);
       await storage.saveGameState(state);
-      const saved = await storage.getGameState();
+      const { state: saved } = await loadActiveStateWithExpiry();
       normalizeGameStateAvatars(saved);
       return res.json({ success: true, gameState: saved });
     } catch (err) {
@@ -1466,6 +1572,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (sdpType !== expectedType) return false;
       if (typeof sdp !== 'string' || !sdp.trim() || sdp.length > WS_MAX_SDP_CHARS) return false;
       return true;
+    };
+
+    const extractValidSdpPayload = (msg: any, expectedType: 'offer' | 'answer') => {
+      // Accept both legacy client format (msg.sdp) and strict format (msg.offer/msg.answer).
+      const primary = expectedType === 'offer' ? msg?.offer : msg?.answer;
+      if (hasValidSdpPayload(primary, expectedType)) return primary;
+      if (hasValidSdpPayload(msg?.sdp, expectedType)) return msg.sdp;
+      return null;
     };
 
     const hasValidCandidatePayload = (value: unknown): boolean => {
@@ -1642,11 +1756,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
               return;
             }
 
-            if (type === 'offer' && !hasValidSdpPayload(msg.offer, 'offer')) {
+            const offerPayload = type === 'offer' ? extractValidSdpPayload(msg, 'offer') : null;
+            const answerPayload = type === 'answer' ? extractValidSdpPayload(msg, 'answer') : null;
+
+            if (type === 'offer' && !offerPayload) {
               console.warn('[WebSocket] invalid offer payload dropped', { from: registeredId, to, ip: senderRec.ip });
               return;
             }
-            if (type === 'answer' && !hasValidSdpPayload(msg.answer, 'answer')) {
+            if (type === 'answer' && !answerPayload) {
               console.warn('[WebSocket] invalid answer payload dropped', { from: registeredId, to, ip: senderRec.ip });
               return;
             }
@@ -1666,13 +1783,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
             if (targetRec) {
               try {
                 if (targetRec.ws.readyState === WebSocket.OPEN) {
-                  // Prevent sender spoofing by rewriting the authoritative sender id.
-                  const forwarded = {
-                    ...msg,
+                  // Prevent sender spoofing and normalize SDP field names for client compatibility.
+                  const forwarded: any = {
+                    type,
                     from: registeredId,
                     to,
-                    type,
                   };
+                  if (type === 'offer' && offerPayload) {
+                    forwarded.sdp = offerPayload;
+                    forwarded.offer = offerPayload;
+                  } else if (type === 'answer' && answerPayload) {
+                    forwarded.sdp = answerPayload;
+                    forwarded.answer = answerPayload;
+                  } else if (type === 'candidate') {
+                    forwarded.candidate = msg.candidate;
+                  }
                   targetRec.ws.send(JSON.stringify(forwarded));
                 } else {
                   console.warn('[WebSocket] target not open for', to, 'state=', targetRec.ws.readyState);

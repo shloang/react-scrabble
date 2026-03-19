@@ -423,12 +423,14 @@ export default function Game() {
           }
         };
 
-      // Send immediately once, then every 2s while placedTiles exist
+      // Send immediately once, then every 2s only while placedTiles exist.
       let interval: number | null = null;
       (async () => {
         await send();
         if (stopped) return;
-        interval = window.setInterval(() => { send(); }, 2000) as unknown as number;
+        if (placedTiles.length > 0) {
+          interval = window.setInterval(() => { send(); }, 2000) as unknown as number;
+        }
       })();
 
       return () => {
@@ -1097,7 +1099,8 @@ export default function Game() {
     const currentPlayer = getCurrentPlayer();
     if (!currentPlayer) return;
 
-    const newState = structuredClone(gameState);
+    const freshState = await getGameState();
+    const newState = structuredClone(freshState || gameState);
     const newPlayer = Array.isArray(newState.players) ? newState.players.find(p => p.id === playerId) : undefined;
     if (!newPlayer) return;
 
@@ -1208,7 +1211,16 @@ export default function Game() {
       const boardForScore = clientBoardState || gameState.board;
       const score = calculateScore(words, boardForScore, placedTiles);
       
-      const newState = structuredClone(gameState);
+      const freshState = await getGameState();
+      const baseState = freshState || gameState;
+      if (!baseState || baseState.currentPlayer !== playerId) {
+        toast({ variant: 'destructive', title: 'Ход уже изменился', description: 'Обновите состояние и попробуйте снова' });
+        await refetch();
+        setIsValidating(false);
+        return;
+      }
+
+      const newState = structuredClone(baseState);
       const currentPlayer = Array.isArray(newState.players) ? newState.players.find(p => p.id === playerId) : undefined;
       if (!currentPlayer) return;
 
@@ -1466,7 +1478,6 @@ export default function Game() {
     pendingPatchRef.current.board = {};
     pendingPatchRef.current.rack = {};
     pendingPatchRef.current.timer = null;
-    try { sessionStorage.setItem('voluntaryLobbyVisit', '1'); } catch {}
     try { setLocation('/lobby'); } catch {}
     toast({ title: 'Вы вернулись в лобби' });
   };
@@ -1506,7 +1517,6 @@ export default function Game() {
               }}
               onNewGame={() => {
                 // Navigate back to lobby page
-                try { sessionStorage.setItem('voluntaryLobbyVisit', '1'); } catch {}
                 try { setLocation('/lobby'); } catch {}
                 setShowEndScreen(false);
                 setShowEndScreenMinimized(false);

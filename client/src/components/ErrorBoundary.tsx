@@ -14,9 +14,20 @@ function NavigateButton() {
   return (
     <button
       onClick={() => setLocation('/lobby')}
-      className="mt-4 px-4 py-2 rounded bg-blue-600 text-white"
+      className="mt-2 px-4 py-2 rounded bg-blue-600 text-white"
     >
       Вернуться в лобби
+    </button>
+  );
+}
+
+function ReloadButton() {
+  return (
+    <button
+      onClick={() => window.location.reload()}
+      className="mt-4 px-4 py-2 rounded bg-zinc-800 text-white"
+    >
+      Перезагрузить страницу
     </button>
   );
 }
@@ -36,7 +47,8 @@ export default class ErrorBoundary extends React.Component<Props, State> {
     if (this.state.hasError) {
       return (
         <div className="p-6">
-          <div>Произошла ошибка отображения игры — возвращаем в лобби</div>
+          <div>Произошла ошибка интерфейса.</div>
+          <ReloadButton />
           <NavigateButton />
         </div>
       );

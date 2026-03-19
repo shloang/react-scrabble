@@ -34,14 +34,14 @@ export default function VoiceChatMinimal({ playerId, voiceVolume = 1, playerName
     let cleanupCurrent: (() => void) | null = null;
 
     const setup = () => {
-      try { if (cleanupCurrent) { cleanupCurrent(); cleanupCurrent = null; } } catch (e) {}
-
-      // Guard: do not open a WebSocket if there is no signaling token.
       const signalingToken = getSignalingToken();
       if (!signalingToken) {
-        console.warn('[VoiceChat] no signaling token present, skipping WebSocket connection');
+        // Do not open websocket without signaling credentials.
+        setWsState('none');
         return;
       }
+
+      try { if (cleanupCurrent) { cleanupCurrent(); cleanupCurrent = null; } } catch (e) {}
 
       const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
       let ws: WebSocket | null = null;
@@ -67,13 +67,6 @@ export default function VoiceChatMinimal({ playerId, voiceVolume = 1, playerName
         console.log('[VoiceChat] ws open');
         setWsState('open');
         try {
-          const signalingToken = getSignalingToken();
-          if (!signalingToken) {
-            console.warn('[VoiceChat] missing signaling token, closing websocket');
-            setWsState('error');
-            ws!.close();
-            return;
-          }
           ws!.send(JSON.stringify({ type: 'join', playerId, signalingToken }));
         } catch (e) {}
         try {
@@ -121,7 +114,14 @@ export default function VoiceChatMinimal({ playerId, voiceVolume = 1, playerName
     };
 
     setup();
-    const onReconnect = () => { try { if (cleanupCurrent) { cleanupCurrent(); cleanupCurrent = null; } } catch (e) {} setup(); };
+    const onReconnect = () => {
+      if (!getSignalingToken()) {
+        setWsState('none');
+        return;
+      }
+      try { if (cleanupCurrent) { cleanupCurrent(); cleanupCurrent = null; } } catch (e) {}
+      setup();
+    };
     window.addEventListener('voicechat:reconnect', onReconnect);
     return () => { try { if (cleanupCurrent) cleanupCurrent(); } catch (e) {} window.removeEventListener('voicechat:reconnect', onReconnect); };
   }, [playerId]);

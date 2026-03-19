@@ -7,7 +7,7 @@ import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { getGameState, updateGameState, leaveGame } from '@/lib/gameApi';
+import { getGameState, updateGameState, leaveGame, resetSession as resetSessionApi } from '@/lib/gameApi';
 import { useToast } from '@/hooks/use-toast';
 import { getStats } from '@/lib/playerStats';
 import { deriveCacheBadgeState } from '@/lib/statsCacheDisplay';
@@ -20,6 +20,10 @@ const VoiceChat = lazy(() => import('@/components/VoiceChat'));
 
 const MAX_AVATAR_UPLOAD_BYTES = 262144;
 const MAX_AVATAR_DATA_URL_LENGTH = 360000;
+
+function hasGameInProgress(state: any): boolean {
+  return !!state?.currentPlayer && (state?.turn || 0) > 0 && !state?.gameEnded;
+}
 
 type AvatarFallbackData = {
   seed?: string;
@@ -133,16 +137,6 @@ export default function Lobby() {
   const { toast } = useToast();
   const queryClient = useQueryClient();
   const [, setLocation] = useLocation();
-  // Track whether the player deliberately navigated here (prevents auto-redirect back to game)
-  const voluntaryVisitRef = useRef<boolean>(false);
-  useEffect(() => {
-    try {
-      if (sessionStorage.getItem('voluntaryLobbyVisit') === '1') {
-        voluntaryVisitRef.current = true;
-        sessionStorage.removeItem('voluntaryLobbyVisit');
-      }
-    } catch {}
-  }, []);
 
   const { data: gameState, refetch } = useQuery({
     queryKey: ['/api/game'],
@@ -242,6 +236,7 @@ export default function Lobby() {
     micEnabled: false,
   });
   const previousWsStateRef = useRef<typeof voiceState.wsState>('none');
+  const previousGameStateRef = useRef<any | null>(null);
 
   const activeSessionPlayer = gameState?.players?.find((p: any) => p.id === playerId) || null;
   const avatarDialogPreviewUrl = useMemo(() => {
@@ -255,9 +250,27 @@ export default function Lobby() {
     [activeSessionPlayer, avatarDialogPreviewUrl],
   );
   const hasActiveSession = !!playerId && !!activeSessionPlayer;
-  const gameInProgress = !!gameState?.currentPlayer && (gameState?.turn || 0) > 0 && !gameState?.gameEnded;
+  const isHost = !!playerId && (gameState?.players?.[0]?.id === playerId);
+  const gameInProgress = hasGameInProgress(gameState);
   const allReady = !!gameState?.players?.length && (gameState.players || []).every((p: any) => !!p.ready);
   const readyCount = gameState?.players?.filter((p: any) => !!p.ready).length || 0;
+
+  useEffect(() => {
+    const prevState = previousGameStateRef.current;
+    previousGameStateRef.current = gameState;
+
+    if (!playerId || !gameState || !prevState) return;
+
+    const transitionedToGame = !hasGameInProgress(prevState) && hasGameInProgress(gameState);
+    if (!transitionedToGame) return;
+
+    const wasReadyBeforeStart = Array.isArray(prevState.players)
+      && prevState.players.some((p: any) => p.id === playerId && !!p.ready);
+    if (!wasReadyBeforeStart) return;
+
+    setLocation('/');
+    toast({ title: 'Игра началась', description: 'Вы были готовы и автоматически вошли в игру' });
+  }, [gameState, playerId, setLocation, toast]);
 
   useEffect(() => {
     if (!playerId) {
@@ -395,7 +408,6 @@ export default function Lobby() {
           // ignore refetch errors; still attempt navigation
         }
         // navigate to game
-        voluntaryVisitRef.current = false;
         setLocation('/');
         toast({ title: 'Игра начата' });
       } else {
@@ -466,8 +478,33 @@ export default function Lobby() {
     }
   };
 
+  const handleResetSession = async () => {
+    if (!playerId) {
+      toast({ variant: 'destructive', title: 'Сессия недействительна', description: 'Перезайдите в лобби и повторите' });
+      return;
+    }
+    const ok = window.confirm('Сбросить текущую сессию? Это удалит всех игроков из лобби/игры и очистит состояние партии.');
+    if (!ok) return;
+
+    try {
+      const resp = await resetSessionApi(playerId);
+      if (resp?.gameState) {
+        queryClient.setQueryData(['/api/game'], resp.gameState);
+      } else {
+        queryClient.invalidateQueries({ queryKey: ['/api/game'] });
+      }
+      setVoiceStarted(false);
+      setVoiceMicMuted(false);
+      setVoicePeerMuted({});
+      setVoicePeerVolumes({});
+      setVoiceReconnectAttempt(0);
+      toast({ title: 'Сессия сброшена', description: 'Лобби и партия очищены' });
+    } catch (err: any) {
+      toast({ variant: 'destructive', title: 'Не удалось сбросить сессию', description: err?.message || 'Ошибка' });
+    }
+  };
+
   const handleEnterGame = async () => {
-    voluntaryVisitRef.current = false;
     if (!gameInProgress) {
       toast({ title: 'Игра ещё не начата', description: 'Сначала нажмите «Начать игру»' });
       return;
@@ -728,38 +765,6 @@ export default function Lobby() {
       expiresAtLabel,
     ].join(' | ');
   }
-
-  // When the server marks the game as started, automatically navigate
-  // authenticated lobby clients into the game so they don't need to click "Enter".
-  useEffect(() => {
-    if (!gameInProgress || authState !== 'valid') return;
-
-    // If the player deliberately navigated here (e.g. via "Back to Lobby"),
-    // skip the auto-redirect so they can stay in the lobby.
-    if (voluntaryVisitRef.current) return;
-
-    // Refetch authoritative game state before navigating so the Game page
-    // mounts with up-to-date data (avoids race conditions that can crash the UI).
-    let cancelled = false;
-    (async () => {
-      try {
-        const fresh = await refetch();
-        await new Promise(r => setTimeout(r, 150));
-        // ensure local player is present on server before navigating
-        const stored = typeof window !== 'undefined' ? localStorage.getItem('playerId') : null;
-        if (stored && fresh?.data && Array.isArray(fresh.data.players) && !fresh.data.players.some((p:any) => p.id === stored)) {
-          // try a quick second refetch
-          try { await refetch(); } catch {}
-        }
-      } catch (err) {
-        // ignore refetch errors — still attempt navigation
-      }
-      if (cancelled) return;
-      try { setLocation('/'); } catch (err) { /* ignore */ }
-    })();
-
-    return () => { cancelled = true; };
-  }, [gameInProgress, authState, setLocation, refetch]);
 
   function PlayerRow({ player, localStats, isLocal, onToggleReady }: any) {
     const {
@@ -1123,7 +1128,10 @@ export default function Lobby() {
         <div className="mt-6 flex gap-3 justify-end">
           <Button onClick={handleEnterGame} disabled={!gameInProgress} data-testid="button-enter-game">Войти в игру</Button>
           <Button variant="outline" onClick={handleLeaveLobby}>Покинуть лобби</Button>
-          {!gameInProgress && (gameState?.players?.length || 0) > 0 && gameState?.players?.[0]?.id === localStorage.getItem('playerId') && (
+          {isHost && (
+            <Button variant="destructive" onClick={handleResetSession}>Сбросить сессию</Button>
+          )}
+          {!gameInProgress && isHost && (
             <Button variant="secondary" onClick={handleStart} disabled={isStarting || !allReady}>{isStarting ? 'Запуск...' : 'Начать игру'}</Button>
           )}
         </div>
