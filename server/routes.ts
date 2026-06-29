@@ -1447,10 +1447,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         p.ready = false; // reset ready flag
       }
 
-      // reset board/moves and set current player to first player
+      const firstTurnIndex = Math.floor(Math.random() * state.players.length);
+      const firstTurnPlayerId = state.players[firstTurnIndex]?.id ?? state.players[0]?.id ?? null;
+
+      // reset board/moves and set current player explicitly at random
       state.board = Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(null));
       state.moves = [];
-      state.currentPlayer = state.players[0].id;
+      state.currentPlayer = firstTurnPlayerId;
       state.turn = 1;
       state.turnStart = Date.now();
       state.paused = true;

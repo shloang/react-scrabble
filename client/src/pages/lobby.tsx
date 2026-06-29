@@ -3,7 +3,6 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useLocation } from 'wouter';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -25,13 +24,6 @@ function hasGameInProgress(state: any): boolean {
   return !!state?.currentPlayer && (state?.turn || 0) > 0 && !state?.gameEnded;
 }
 
-type AvatarFallbackData = {
-  seed?: string;
-  initials: string;
-  backgroundColor: string;
-  textColor: string;
-};
-
 type CacheTelemetryPayload = {
   playerId: string;
   label: string;
@@ -44,38 +36,6 @@ type CacheTelemetryPayload = {
   expired: boolean;
   source: string;
 };
-
-function fallbackInitialsFromName(name: string): string {
-  const trimmed = String(name || '').trim().replace(/\s+/g, ' ');
-  if (!trimmed) return '??';
-  const parts = trimmed.split(' ').filter(Boolean);
-  if (parts.length >= 2) {
-    const a = Array.from(parts[0])[0] || '?';
-    const b = Array.from(parts[1])[0] || '?';
-    return `${a}${b}`.toUpperCase();
-  }
-  const chars = Array.from(parts[0] || '');
-  const first = chars[0] || '?';
-  const second = chars[1] || first || '?';
-  return `${first}${second}`.toUpperCase();
-}
-
-function getPlayerAvatarFallback(player: any): AvatarFallbackData {
-  const fallback = player?.avatarFallback;
-  if (
-    fallback
-    && typeof fallback.initials === 'string'
-    && typeof fallback.backgroundColor === 'string'
-    && typeof fallback.textColor === 'string'
-  ) {
-    return fallback;
-  }
-  return {
-    initials: fallbackInitialsFromName(player?.name || ''),
-    backgroundColor: '#3f3f46',
-    textColor: '#f4f4f5',
-  };
-}
 
 function validateRemoteAvatarUrl(rawValue: string): { value?: string; error?: string } {
   const trimmed = rawValue.trim();
@@ -97,38 +57,21 @@ function validateRemoteAvatarUrl(rawValue: string): { value?: string; error?: st
   }
 }
 
-const PlayerAvatar = memo(function PlayerAvatar({ player, className = 'h-11 w-11 text-sm ring-1 ring-black/10 dark:ring-white/15 shadow-sm' }: { player: any; className?: string }) {
-  const [imageError, setImageError] = useState(false);
-  const fallback = getPlayerAvatarFallback(player);
-
-  useEffect(() => {
-    setImageError(false);
-  }, [player?.avatarUrl]);
+const PlayerAvatar = memo(function PlayerAvatar({ player, className = 'h-11 w-11 ring-1 ring-black/10 dark:ring-white/15 shadow-sm' }: { player: any; className?: string }) {
+  const playerName = String(player?.name || 'игрок');
+  const avatarUrl = `https://robohash.org/${encodeURIComponent(playerName)}?size=160x160`;
 
   return (
-    <Avatar className={className}>
-      {player?.avatarUrl && !imageError ? (
-        <AvatarImage
-          src={player.avatarUrl}
-          alt={`Аватар ${player?.name || 'игрока'}`}
-          loading="lazy"
-          decoding="async"
-          referrerPolicy="no-referrer"
-          className="object-cover"
-          onError={() => setImageError(true)}
-        />
-      ) : null}
-      <AvatarFallback
-        style={{
-          color: fallback.textColor,
-          backgroundColor: fallback.backgroundColor,
-          backgroundImage: `radial-gradient(circle at 28% 22%, rgba(255,255,255,0.28), transparent 62%), linear-gradient(140deg, ${fallback.backgroundColor}, rgba(0,0,0,0.28))`,
-        }}
-        className="font-semibold tracking-wide motion-safe:animate-pulse [animation-duration:3.2s]"
-      >
-        {fallback.initials}
-      </AvatarFallback>
-    </Avatar>
+    <div className={`overflow-hidden rounded-full bg-muted flex items-center justify-center shrink-0 ${className}`}>
+      <img
+        src={avatarUrl}
+        alt={`Аватар ${playerName}`}
+        loading="lazy"
+        decoding="async"
+        referrerPolicy="no-referrer"
+        className="h-full w-full object-cover"
+      />
+    </div>
   );
 });
 PlayerAvatar.displayName = 'PlayerAvatar';
@@ -264,12 +207,12 @@ export default function Lobby() {
     const transitionedToGame = !hasGameInProgress(prevState) && hasGameInProgress(gameState);
     if (!transitionedToGame) return;
 
-    const wasReadyBeforeStart = Array.isArray(prevState.players)
-      && prevState.players.some((p: any) => p.id === playerId && !!p.ready);
-    if (!wasReadyBeforeStart) return;
+    const isActiveParticipant = Array.isArray(gameState.players)
+      && gameState.players.some((p: any) => p.id === playerId);
+    if (!isActiveParticipant) return;
 
     setLocation('/');
-    toast({ title: 'Игра началась', description: 'Вы были готовы и автоматически вошли в игру' });
+    toast({ title: 'Игра началась', description: 'Лобби автоматически перевело вас в партию' });
   }, [gameState, playerId, setLocation, toast]);
 
   useEffect(() => {
