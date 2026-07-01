@@ -43,7 +43,7 @@ export class MemStorage implements IStorage {
 }
 class FileStorage implements IStorage {
   private filePath: string;
-  private credPath: string;
+  private credPath: string = '';
   private credentials: Record<string, string>;
 
   constructor(filePath?: string) {

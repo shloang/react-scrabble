@@ -31,10 +31,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
     expiresAt: number;
     stateRevision: number;
   };
+  type CacheStatus = 'fresh' | 'stale' | 'expired';
   const voiceTokens = new Map<string, VoiceTokenRecord>();
   const playerStatsCache = new Map<string, CachedStatsEntry>();
   const playerStatsCacheLogSignatures = new Map<string, string>();
-  const playerStatsCacheStatusByPlayer = new Map<string, string>();
+  const playerStatsCacheStatusByPlayer = new Map<string, CacheStatus>();
 
   const MAX_AVATAR_REMOTE_URL_LENGTH = 1024;
   const MAX_AVATAR_DATA_URL_LENGTH = parseInt(process.env.MAX_AVATAR_DATA_URL_LENGTH || '360000', 10);
@@ -169,7 +170,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     return `${first}${second}`.toUpperCase();
   }
 
-  function buildAvatarFallback(player: Pick<Player, 'id' | 'name'>): Player['avatarFallback'] {
+  function buildAvatarFallback(player: Pick<Player, 'id' | 'name'>): NonNullable<Player['avatarFallback']> {
     const seed = createHash('sha256').update(`${player.id}:${String(player.name || '').trim().toLowerCase()}`).digest('hex').slice(0, 16);
     const idx = parseInt(seed.slice(0, 8), 16) % AVATAR_FALLBACK_PALETTE.length;
     const palette = AVATAR_FALLBACK_PALETTE[idx];
@@ -258,10 +259,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
     player.avatarFallback = fallback;
 
     const fallbackChanged = !previousFallback
-      || previousFallback.seed !== fallback.seed
-      || previousFallback.initials !== fallback.initials
-      || previousFallback.backgroundColor !== fallback.backgroundColor
-      || previousFallback.textColor !== fallback.textColor;
+      || previousFallback?.seed !== fallback.seed
+      || previousFallback?.initials !== fallback.initials
+      || previousFallback?.backgroundColor !== fallback.backgroundColor
+      || previousFallback?.textColor !== fallback.textColor;
 
     return {
       changed: previousUrl !== player.avatarUrl || fallbackChanged,
@@ -376,7 +377,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const ageMs = Math.max(0, now - entry.cachedAt);
     const isExpired = now >= entry.expiresAt;
     const isStale = isExpired || now >= entry.staleAt;
-    const cacheStatus = isExpired ? 'expired' : (isStale ? 'stale' : 'fresh');
+    const cacheStatus: CacheStatus = isExpired ? 'expired' : (isStale ? 'stale' : 'fresh');
 
     return {
       playerId: entry.playerId,
@@ -715,7 +716,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         id: playerId,
         name: playerName.trim(),
         rack,
-        score: 0
+        score: 0,
+        ready: false,
+        voiceEnabled: false
       };
 
       gameState.players.push(newPlayer);
@@ -805,7 +808,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const { state } = await loadActiveStateWithExpiry();
       if (state && Array.isArray(state.players) && state.players.length > 0) {
         const hostId = state.players[0]?.id;
-        if (!hostId || hostId !== requesterId) {
+        const isParticipant = state.players.some((p) => p.id === requesterId);
+        const canParticipantResetEndedGame = !!state.gameEnded && isParticipant;
+        if ((!hostId || hostId !== requesterId) && !canParticipantResetEndedGame) {
           return res.status(403).json({ error: 'Only lobby host can reset session' });
         }
         for (const p of state.players) revokeVoiceToken(p.id);
@@ -1599,7 +1604,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const sdpMLineIndex = value.sdpMLineIndex;
       if (sdpMLineIndex !== undefined && sdpMLineIndex !== null) {
-        if (!Number.isInteger(sdpMLineIndex) || sdpMLineIndex < 0 || sdpMLineIndex > 65535) return false;
+        if (typeof sdpMLineIndex !== 'number' || !Number.isInteger(sdpMLineIndex) || sdpMLineIndex < 0 || sdpMLineIndex > 65535) return false;
       }
 
       return true;

@@ -111,14 +111,26 @@ export default function EndGameScreen({ gameState, currentPlayerId, onNewGame, o
               <Trophy className="w-5 h-5 text-yellow-500" />
               <h3 className="font-semibold">Итоговые очки</h3>
             </div>
-            <div className="space-y-2">
-              {(gameState.players || []).slice().sort((a, b) => b.score - a.score)
+            <div className="space-y-3">
+              {(gameState.players || []).slice().sort((a, b) => (b.score || 0) - (a.score || 0))
                 .map((player, idx) => (
-                  <div key={player.id} className="flex justify-between items-center">
-                    <span className={player.id === gameState.winnerId ? 'font-bold' : ''}>
-                      {idx + 1}. {player.name}
-                    </span>
-                    <span className="font-semibold">{player.score}</span>
+                  <div key={player.id} className="flex justify-between items-start">
+                    <div>
+                      <div className={player.id === gameState.winnerId ? 'font-bold' : ''}>
+                        {idx + 1}. {player.name}
+                      </div>
+                      {(player.originalScore !== undefined || player.tilePenalty !== undefined) && (
+                        <div className="text-xs text-muted-foreground mt-1 space-y-0.5">
+                          {player.originalScore !== undefined && (
+                            <div>Исходные: {player.originalScore} очков</div>
+                          )}
+                          {player.tilePenalty !== undefined && player.tilePenalty > 0 && (
+                            <div className="text-red-600">Штраф за фишки: -{player.tilePenalty}</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    <span className="font-semibold">{player.score || 0}</span>
                   </div>
                 ))}
             </div>

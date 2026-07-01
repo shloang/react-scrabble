@@ -42,6 +42,10 @@ export interface Player {
   avatarFallback?: AvatarFallbackData;
   score: number;
   ready?: boolean;
+  voiceEnabled?: boolean;
+  // Final score details (populated when game ends)
+  originalScore?: number; // Score before penalty
+  tilePenalty?: number; // Cost of remaining tiles
 }
 
 export interface AvatarFallbackData {
@@ -122,6 +126,7 @@ export const playerSchema = z.object({
   }).optional(),
   score: z.number(),
   ready: z.boolean().optional(),
+  voiceEnabled: z.boolean().optional(),
 });
 
 export const boardCellSchema = z.object({

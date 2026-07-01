@@ -1,6 +1,6 @@
 import { SquareType } from "@shared/schema";
 import Tile from "./Tile";
-import { useEffect, useRef, useState } from 'react';
+import { useElementSize } from '@/hooks/useElementSize';
 
 interface BoardSquareProps {
   row: number;
@@ -34,6 +34,58 @@ const SQUARE_LABELS: Record<SquareType, string> = {
   START: '★',
   NORMAL: ''
 };
+
+function BoardTile({
+  row,
+  col,
+  letter,
+  isBlankPlaced,
+  isLastMove,
+  onClick,
+}: {
+  row: number;
+  col: number;
+  letter: string;
+  isBlankPlaced?: boolean;
+  isLastMove?: boolean;
+  onClick?: () => void;
+}) {
+  const { ref: containerRef, size } = useElementSize<HTMLDivElement>();
+  const tileSize = Math.min(size.width, size.height);
+  const fontStyle: React.CSSProperties = tileSize ? { fontSize: Math.max(10, Math.round(tileSize * 0.5)) + 'px' } : {};
+
+  return (
+    <div ref={containerRef} className="w-[85%] h-[85%]">
+      <Tile
+        letter={letter}
+        isBlank={!!isBlankPlaced}
+        style={{ ...fontStyle, compactBadge: true } as any}
+        onClick={onClick}
+        onDragStart={(e) => {
+          try {
+            e.dataTransfer.setData('text/plain', JSON.stringify({ source: 'board', fromRow: row, fromCol: col, letter }));
+            e.dataTransfer.effectAllowed = 'move';
+            document.body.classList.add('dragging');
+
+            const ghost = document.createElement('div');
+            ghost.className = 'drag-ghost';
+            ghost.textContent = letter;
+            document.body.appendChild(ghost);
+            const rect = ghost.getBoundingClientRect();
+            const offsetX = rect.width / 2;
+            const offsetY = rect.height / 2;
+            try { e.dataTransfer.setDragImage(ghost, offsetX, offsetY); } catch (err) {}
+            setTimeout(() => ghost.remove(), 0);
+          } catch (err) {
+            // ignore
+          }
+        }}
+        onDragEnd={() => { document.body.classList.remove('dragging'); }}
+        isSelected={isLastMove}
+      />
+    </div>
+  );
+}
 
 export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isBlankPlaced, isTypingCursor, onClick, onDrop, highlight, isLastMove, preview }: BoardSquareProps) {
   const hasLetter = letter !== null;
@@ -90,62 +142,14 @@ export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isB
       data-testid={`square-${row}-${col}`}
     >
       {hasLetter ? (
-        (() => {
-          const containerRef = useRef<HTMLDivElement | null>(null);
-          const [tileSize, setTileSize] = useState<number>(0);
-
-          useEffect(() => {
-            const el = containerRef.current;
-            if (!el) return;
-            // ResizeObserver to update tile size when square resizes
-            const ro = new (window as any).ResizeObserver((entries: any) => {
-              for (const entry of entries) {
-                const cr = entry.contentRect;
-                const min = Math.min(cr.width, cr.height);
-                setTileSize(min);
-              }
-            });
-            ro.observe(el);
-            // initial size
-            const rect = el.getBoundingClientRect();
-            setTileSize(Math.min(rect.width, rect.height));
-            return () => ro.disconnect();
-          }, []);
-
-          const fontStyle: React.CSSProperties = tileSize ? { fontSize: Math.max(10, Math.round(tileSize * 0.5)) + 'px' } : {};
-
-          return (
-            <div ref={containerRef} className="w-[85%] h-[85%]">
-              <Tile
-                letter={letter}
-                isBlank={!!isBlankPlaced}
-                style={{ ...fontStyle, compactBadge: true } as any}
-                onClick={onClick}
-                onDragStart={(e) => {
-                  try {
-                    e.dataTransfer.setData('text/plain', JSON.stringify({ source: 'board', fromRow: row, fromCol: col, letter }));
-                    e.dataTransfer.effectAllowed = 'move';
-                    document.body.classList.add('dragging');
-
-                    const ghost = document.createElement('div');
-                    ghost.className = 'drag-ghost';
-                    ghost.textContent = letter;
-                    document.body.appendChild(ghost);
-                    const rect = ghost.getBoundingClientRect();
-                    const offsetX = rect.width / 2;
-                    const offsetY = rect.height / 2;
-                    try { e.dataTransfer.setDragImage(ghost, offsetX, offsetY); } catch (err) {}
-                    setTimeout(() => ghost.remove(), 0);
-                  } catch (err) {
-                    // ignore
-                  }
-                }}
-                onDragEnd={() => { document.body.classList.remove('dragging'); }}
-                isSelected={isLastMove}
-              />
-            </div>
-          );
-        })()
+        <BoardTile
+          row={row}
+          col={col}
+          letter={letter}
+          isBlankPlaced={isBlankPlaced}
+          isLastMove={isLastMove}
+          onClick={onClick}
+        />
       ) : (
         type !== 'NORMAL' && (
           <span className="text-xs font-bold uppercase tracking-wide text-white dark:text-white/90">

@@ -13,7 +13,7 @@ import { deriveCacheBadgeState } from '@/lib/statsCacheDisplay';
 import JoinGameDialog from '@/components/JoinGameDialog';
 import handleInvalidSession from '@/lib/session';
 import { joinGame as joinGameApi } from '@/lib/gameApi';
-import { Loader2, Mic, MicOff, PhoneCall, PhoneOff, RefreshCw, Signal, SignalHigh, Trash2, Upload, UserRoundCheck, Volume2, VolumeX } from 'lucide-react';
+import { ChevronDown, ChevronRight, Loader2, Mic, MicOff, PhoneCall, PhoneOff, RefreshCw, Signal, SignalHigh, Trash2, Upload, UserRoundCheck, Volume2, VolumeX } from 'lucide-react';
 
 const VoiceChat = lazy(() => import('@/components/VoiceChat'));
 
@@ -155,6 +155,7 @@ export default function Lobby() {
   const [voicePeerMuted, setVoicePeerMuted] = useState<Record<string, boolean>>({});
   const [voicePeerVolumes, setVoicePeerVolumes] = useState<Record<string, number>>({});
   const [voiceReconnectAttempt, setVoiceReconnectAttempt] = useState(0);
+  const [voicePanelOpen, setVoicePanelOpen] = useState(false);
   const [avatarDialogOpen, setAvatarDialogOpen] = useState(false);
   const [avatarUrlInput, setAvatarUrlInput] = useState('');
   const [avatarUploadDataUrl, setAvatarUploadDataUrl] = useState<string | null>(null);
@@ -195,8 +196,23 @@ export default function Lobby() {
   const hasActiveSession = !!playerId && !!activeSessionPlayer;
   const isHost = !!playerId && (gameState?.players?.[0]?.id === playerId);
   const gameInProgress = hasGameInProgress(gameState);
+  const gameEnded = !!gameState?.gameEnded;
+  const canResetSession = !!activeSessionPlayer && (isHost || gameEnded);
+  const sessionStatusClass = gameEnded
+    ? 'text-amber-600 dark:text-amber-400'
+    : hasActiveSession
+      ? 'text-green-600 dark:text-green-400'
+      : 'text-amber-600 dark:text-amber-400';
+  const sessionStatusLabel = gameEnded
+    ? `Партия завершена${activeSessionPlayer?.name ? ` (${activeSessionPlayer.name})` : ''}`
+    : hasActiveSession
+      ? `Активна (${activeSessionPlayer?.name || 'игрок'})`
+      : 'Не активна';
   const allReady = !!gameState?.players?.length && (gameState.players || []).every((p: any) => !!p.ready);
   const readyCount = gameState?.players?.filter((p: any) => !!p.ready).length || 0;
+  const localVoiceEnabled = !!activeSessionPlayer?.voiceEnabled;
+  const voiceEnabledCount = gameState?.players?.filter((p: any) => !!p.voiceEnabled).length || 0;
+  const allPlayersVoiceEnabled = !!gameState?.players?.length && (gameState.players || []).every((p: any) => !!p.voiceEnabled);
 
   useEffect(() => {
     const prevState = previousGameStateRef.current;
@@ -238,6 +254,37 @@ export default function Lobby() {
     setVoicePeerVolumes({});
     setVoiceReconnectAttempt(0);
   }, [authState, hasActiveSession]);
+
+  useEffect(() => {
+    if (!gameEnded) return;
+    setVoiceStarted(false);
+    setVoiceMicMuted(false);
+    setVoicePeerMuted({});
+    setVoicePeerVolumes({});
+    setVoiceReconnectAttempt(0);
+  }, [gameEnded]);
+
+  useEffect(() => {
+    if (!localVoiceEnabled || !allPlayersVoiceEnabled) {
+      if (voiceStarted) {
+        setVoiceStarted(false);
+        setVoiceMicMuted(false);
+        setVoicePeerMuted({});
+        setVoicePeerVolumes({});
+        setVoiceReconnectAttempt(0);
+      }
+      return;
+    }
+
+    let signalingToken: string | null = null;
+    try {
+      signalingToken = localStorage.getItem('signalingToken');
+    } catch {}
+    if (signalingToken && !voiceStarted) {
+      setVoiceStarted(true);
+      setVoiceMicMuted(false);
+    }
+  }, [localVoiceEnabled, allPlayersVoiceEnabled, voiceStarted]);
 
   useEffect(() => {
     if (!voiceStarted) return;
@@ -302,8 +349,24 @@ export default function Lobby() {
 
   const handleToggleReady = async (playerId: string) => {
     try {
+      if (gameState?.gameEnded) {
+        toast({
+          variant: 'destructive',
+          title: 'Партия завершена',
+          description: 'Сначала сбросьте сессию, затем соберите новое лобби.',
+        });
+        return;
+      }
       const fresh = await getGameState();
       if (!fresh) return;
+      if (fresh.gameEnded) {
+        toast({
+          variant: 'destructive',
+          title: 'Партия завершена',
+          description: 'Сначала сбросьте сессию, затем соберите новое лобби.',
+        });
+        return;
+      }
       const ns = structuredClone(fresh) as any;
       const me = ns.players.find((x: any) => x.id === playerId);
       if (!me) return;
@@ -455,7 +518,28 @@ export default function Lobby() {
     setLocation('/');
   };
 
-  const handleStartVoice = () => {
+  const setLocalVoiceEnabled = async (enabled: boolean) => {
+    if (!playerId) return null;
+    if (gameEnded) {
+      toast({
+        variant: 'destructive',
+        title: 'Партия завершена',
+        description: 'Сначала сбросьте сессию, затем настройте голос заново.',
+      });
+      return null;
+    }
+    const fresh = await getGameState();
+    if (!fresh) return null;
+    if (fresh.gameEnded) return null;
+    const nextState = structuredClone(fresh) as any;
+    const localPlayer = Array.isArray(nextState.players) ? nextState.players.find((p: any) => p.id === playerId) : null;
+    if (!localPlayer) return null;
+    localPlayer.voiceEnabled = enabled;
+    await updateMutation.mutateAsync(nextState);
+    return nextState;
+  };
+
+  const handleStartVoice = async () => {
     if (!hasActiveSession || !playerId) {
       toast({ variant: 'destructive', title: 'Сессия недействительна', description: 'Перезайдите в лобби перед стартом голоса' });
       return;
@@ -472,12 +556,32 @@ export default function Lobby() {
       });
       return;
     }
-    setVoiceStarted(true);
-    setVoiceMicMuted(false);
-    toast({ title: 'Голос включен', description: 'Инициализируем голосовой канал' });
+    try {
+      const nextState = await setLocalVoiceEnabled(true);
+      if (!nextState) return;
+      const everyoneReady = !!nextState?.players?.length && nextState.players.every((p: any) => !!p.voiceEnabled);
+      if (!everyoneReady) {
+        setVoiceStarted(false);
+        setVoiceMicMuted(false);
+      }
+      toast({
+        title: everyoneReady ? 'Голос включен' : 'Голос ожидает игроков',
+        description: everyoneReady
+          ? 'Все игроки включили голос, инициализируем канал'
+          : 'Соединение начнется, когда все участники включат голос',
+      });
+    } catch (err) {
+      console.error('[Lobby] enable voice failed', err);
+      toast({ variant: 'destructive', title: 'Voice unavailable', description: 'Could not enable voice opt-in.' });
+    }
   };
 
-  const handleStopVoice = () => {
+  const handleStopVoice = async () => {
+    try {
+      await setLocalVoiceEnabled(false);
+    } catch (err) {
+      console.error('[Lobby] disable voice failed', err);
+    }
     setVoiceStarted(false);
     setVoiceMicMuted(false);
     setVoicePeerMuted({});
@@ -844,7 +948,6 @@ export default function Lobby() {
           </div>
           {isLocal && (
             <div className="flex flex-wrap gap-2">
-              <Button size="sm" onClick={onToggleReady}>{player.ready ? 'Отменить' : 'Готов'}</Button>
               <Button size="sm" variant="outline" onClick={() => setAvatarDialogOpen(true)}>Аватар</Button>
             </div>
           )}
@@ -872,8 +975,8 @@ export default function Lobby() {
         <h2 className="text-2xl font-bold mb-4">Лобби — Ожидание игроков</h2>
         <div className="mb-4 flex items-center justify-between rounded border px-3 py-2 text-sm">
           <div className="text-muted-foreground">Сессия</div>
-          <div className={`font-medium ${hasActiveSession ? 'text-green-600 dark:text-green-400' : 'text-amber-600 dark:text-amber-400'}`}>
-            {hasActiveSession ? `Активна (${activeSessionPlayer?.name || 'игрок'})` : 'Не активна'}
+          <div className={`font-medium ${sessionStatusClass}`}>
+            {sessionStatusLabel}
           </div>
         </div>
         <div className="mb-4 rounded border p-3 bg-background/80">
@@ -888,17 +991,42 @@ export default function Lobby() {
                 <UserRoundCheck className="h-3.5 w-3.5" aria-hidden="true" />
                 <span>Участники: {voiceState.peers.length}</span>
               </Badge>
+              <Badge variant={allPlayersVoiceEnabled ? 'secondary' : 'outline'} className="inline-flex items-center gap-1">
+                <span>Голос: {voiceEnabledCount}/{gameState?.players?.length || 0}</span>
+              </Badge>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              {!voiceStarted ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setVoicePanelOpen((prev) => !prev)}
+                aria-expanded={voicePanelOpen}
+                aria-controls="voice-settings-panel"
+              >
+                {voicePanelOpen ? <ChevronDown className="h-4 w-4" aria-hidden="true" /> : <ChevronRight className="h-4 w-4" aria-hidden="true" />}
+                <span>{voicePanelOpen ? 'Скрыть' : 'Настройки'}</span>
+              </Button>
+              {voicePanelOpen && (
+                <>
+              {!localVoiceEnabled ? (
                 <Button
                   size="sm"
                   onClick={handleStartVoice}
-                  disabled={!hasActiveSession || !playerId}
+                  disabled={!hasActiveSession || !playerId || gameEnded}
                   aria-label="Запустить голосовой чат"
                 >
                   <PhoneCall className="h-4 w-4" aria-hidden="true" />
-                  <span>Запустить голос</span>
+                  <span>Включить голос</span>
+                </Button>
+              ) : !voiceStarted ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={handleStopVoice}
+                  aria-label="Отменить готовность к голосовому чату"
+                >
+                  <PhoneOff className="h-4 w-4" aria-hidden="true" />
+                  <span>Ждем голос</span>
                 </Button>
               ) : (
                 <>
@@ -951,6 +1079,8 @@ export default function Lobby() {
                   </Button>
                 </>
               )}
+                </>
+              )}
             </div>
           </div>
 
@@ -963,7 +1093,8 @@ export default function Lobby() {
               : 'Голосовой чат отключен.'}
           </div>
 
-          <div className="mt-3 space-y-2">
+          {voicePanelOpen && (
+          <div id="voice-settings-panel" className="mt-3 space-y-2">
             {(gameState.players || []).map((p: any) => {
               const isLocalParticipant = p.id === playerId;
               const isInVoice = isLocalParticipant
@@ -983,6 +1114,7 @@ export default function Lobby() {
                   <div className="flex items-center gap-2 min-w-0">
                     <PlayerAvatar player={p} className="h-8 w-8 text-[10px] ring-1 ring-black/5 dark:ring-white/10" />
                     <span className="font-medium truncate max-w-[10rem]">{p.name}</span>
+                    <Badge variant={p.voiceEnabled ? 'secondary' : 'outline'}>{p.voiceEnabled ? 'голос готов' : 'голос выкл.'}</Badge>
                     <Badge variant={isInVoice ? 'secondary' : 'outline'}>{isInVoice ? 'в голосе' : 'вне голоса'}</Badge>
                     <Badge variant={peerStatus.variant} aria-live="polite">{peerStatus.label}</Badge>
                     <div
@@ -1034,8 +1166,9 @@ export default function Lobby() {
               );
             })}
           </div>
+          )}
 
-          {voiceStarted && playerId && (
+          {voiceStarted && allPlayersVoiceEnabled && playerId && (
             <Suspense
               fallback={
                 <div className="hidden" aria-hidden>
@@ -1068,10 +1201,15 @@ export default function Lobby() {
             return <PlayerRow key={p.id} player={p} localStats={local} isLocal={isLocal} onToggleReady={() => handleToggleReady(p.id)} />;
           })}
         </div>
-        <div className="mt-6 flex gap-3 justify-end">
+        <div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
+          {!gameInProgress && !gameEnded && activeSessionPlayer && (
+            <Button onClick={() => handleToggleReady(activeSessionPlayer.id)} data-testid="button-ready">
+              {activeSessionPlayer.ready ? 'Отменить готовность' : 'Готов'}
+            </Button>
+          )}
           <Button onClick={handleEnterGame} disabled={!gameInProgress} data-testid="button-enter-game">Войти в игру</Button>
           <Button variant="outline" onClick={handleLeaveLobby}>Покинуть лобби</Button>
-          {isHost && (
+          {canResetSession && (
             <Button variant="destructive" onClick={handleResetSession}>Сбросить сессию</Button>
           )}
           {!gameInProgress && isHost && (

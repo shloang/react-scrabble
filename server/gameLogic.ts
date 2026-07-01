@@ -219,18 +219,52 @@ export function validatePlacement(board: BoardCell[][], placedTiles: PlacedTile[
 }
 
 /**
- * Check if the game has ended
+ * Calculate the total cost of remaining tiles in a player's rack
+ * Blank tiles (?) have value 0
+ */
+export function calculateRemainingTilesCost(rack: (string | null)[]): number {
+  let totalCost = 0;
+  for (const tile of rack) {
+    if (tile !== null && tile !== undefined) {
+      const cost = TILE_VALUES[tile] ?? 0;
+      totalCost += cost;
+    }
+  }
+  return totalCost;
+}
+
+/**
+ * Check if the game has ended and calculate penalty-adjusted winner
  */
 export function checkGameEnd(gameState: GameState): { ended: boolean; reason?: string; winnerId?: string } {
   // Check if any player has no tiles and bag is empty
   for (const player of gameState.players) {
     const hasTiles = player.rack.some(t => t !== null);
     if (!hasTiles && gameState.tileBag.length === 0) {
-      // Find winner (highest score)
-      const winner = gameState.players.reduce((prev, curr) => 
-        curr.score > prev.score ? curr : prev
+      // Calculate penalty-adjusted scores
+      const playersWithPenalties = gameState.players.map(p => ({
+        player: p,
+        originalScore: p.score,
+        tilePenalty: calculateRemainingTilesCost(p.rack),
+        finalScore: p.score - calculateRemainingTilesCost(p.rack)
+      }));
+
+      // Find winner (highest penalty-adjusted score)
+      const winner = playersWithPenalties.reduce((prev, curr) =>
+        curr.finalScore > prev.finalScore ? curr : prev
       );
-      return { ended: true, reason: 'player_out_of_tiles', winnerId: winner.id };
+
+      // Update all players' scores with penalty-adjusted scores and store breakdown
+      gameState.players.forEach(p => {
+        const penalties = playersWithPenalties.find(pw => pw.player.id === p.id);
+        if (penalties) {
+          p.originalScore = penalties.originalScore;
+          p.tilePenalty = penalties.tilePenalty;
+          p.score = penalties.finalScore;
+        }
+      });
+
+      return { ended: true, reason: 'player_out_of_tiles', winnerId: winner.player.id };
     }
   }
 
@@ -240,11 +274,30 @@ export function checkGameEnd(gameState: GameState): { ended: boolean; reason?: s
     const recentMoves = moves.slice(-gameState.players.length * 2);
     const allSkips = recentMoves.every(m => m.type === 'skip');
     if (allSkips) {
-      // Find winner (highest score)
-      const winner = gameState.players.reduce((prev, curr) => 
-        curr.score > prev.score ? curr : prev
+      // Calculate penalty-adjusted scores
+      const playersWithPenalties = gameState.players.map(p => ({
+        player: p,
+        originalScore: p.score,
+        tilePenalty: calculateRemainingTilesCost(p.rack),
+        finalScore: p.score - calculateRemainingTilesCost(p.rack)
+      }));
+
+      // Find winner (highest penalty-adjusted score)
+      const winner = playersWithPenalties.reduce((prev, curr) =>
+        curr.finalScore > prev.finalScore ? curr : prev
       );
-      return { ended: true, reason: 'all_skipped_twice', winnerId: winner.id };
+
+      // Update all players' scores with penalty-adjusted scores and store breakdown
+      gameState.players.forEach(p => {
+        const penalties = playersWithPenalties.find(pw => pw.player.id === p.id);
+        if (penalties) {
+          p.originalScore = penalties.originalScore;
+          p.tilePenalty = penalties.tilePenalty;
+          p.score = penalties.finalScore;
+        }
+      });
+
+      return { ended: true, reason: 'all_skipped_twice', winnerId: winner.player.id };
     }
   }
 

@@ -1,5 +1,5 @@
 import { TILE_VALUES } from "@shared/schema";
-import { useEffect, useRef, useState } from 'react';
+import { useElementSize } from '@/hooks/useElementSize';
 
 interface TileProps {
   letter: string | null;
@@ -36,23 +36,8 @@ export default function Tile({ letter, isSelected, isEmpty, isBlank, onClick, cl
 
   const points = isBlank ? 0 : (TILE_VALUES[letter] ?? 0);
 
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  const [tileSize, setTileSize] = useState(0);
-
-  useEffect(() => {
-    const el = rootRef.current;
-    if (!el) return;
-    const ro = new (window as any).ResizeObserver((entries: any) => {
-      for (const entry of entries) {
-        const r = entry.contentRect;
-        setTileSize(Math.min(r.width, r.height));
-      }
-    });
-    ro.observe(el);
-    const rect = el.getBoundingClientRect();
-    setTileSize(Math.min(rect.width, rect.height));
-    return () => ro.disconnect();
-  }, []);
+  const { ref: rootRef, size } = useElementSize<HTMLDivElement>();
+  const tileSize = Math.min(size.width, size.height);
 
   const explicitFontSize = (() => {
     try {

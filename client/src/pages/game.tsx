@@ -17,6 +17,8 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { CheckCircle, SkipForward, Sun, Moon } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
+import { useAudioKeepAlive } from '@/hooks/useAudioKeepAlive';
+import { usePlayerTileOrder } from '@/hooks/usePlayerTileOrder';
 import { useLocation } from 'wouter';
 import { getStats, incrementWin, incrementLoss, getAllStats } from '@/lib/playerStats';
 
@@ -42,8 +44,6 @@ export default function Game() {
     status: 'valid' | 'invalid' | 'checking';
   }[]>([]);
   const [potentialScore, setPotentialScore] = useState<number | null>(null);
-  // visual-only rack view to support drag-reorder in the UI during planning
-  const [rackView, setRackView] = useState<(string | null)[] | null>(null);
   const [timeLeft, setTimeLeft] = useState(MOVE_TIME);
   const [isDark, setIsDark] = useState<boolean>(() => {
     try { return localStorage.getItem('dark') === '1'; } catch { return false; }
@@ -99,6 +99,10 @@ export default function Game() {
     }));
   }, [setVoicePeerState]);
 
+  // Initialize AudioContext keepalive to prevent browser suspension after 30+ minutes
+  const audioCacheMapRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+  const audioKeepAlive = useAudioKeepAlive(audioCacheMapRef.current, { checkInterval: 10000, debug: false });
+
   const playSound = (filename: string) => {
     try {
       const key = filename;
@@ -113,6 +117,8 @@ export default function Game() {
         audio.volume = soundVolume;
         audio.preload = 'auto';
         audioCache.current[key] = audio;
+        // Keep Map in sync for AudioContext management
+        audioCacheMapRef.current.set(key, audio);
       }
       // ensure volume matches current setting
       try { audio.volume = soundVolume; } catch (err) {}
@@ -121,6 +127,11 @@ export default function Game() {
       try {
         audio.currentTime = 0;
       } catch (err) { /* ignore */ }
+      
+      // Ensure AudioContext is running before playing
+      audioKeepAlive.ensureAudioContext();
+      audioKeepAlive.resumeAudioContext();
+      
       audio.play().catch(err => console.error('Failed to play sound:', err));
     } catch (err) {
       console.error('Failed to load sound:', err);
@@ -131,6 +142,8 @@ export default function Game() {
   useEffect(() => {
     for (const k of Object.keys(audioCache.current)) {
       try { audioCache.current[k].volume = soundVolume; } catch (err) {}
+      // Keep Map in sync
+      audioCacheMapRef.current.set(k, audioCache.current[k]);
     }
   }, [soundVolume]);
 
@@ -397,10 +410,10 @@ export default function Game() {
       return rack;
     }, [gameState, playerId, typedSequence]);
 
-    // initialize rackView when server rack updates
-    useEffect(() => {
-      if (clientRackState) setRackView([...clientRackState]);
-    }, [clientRackState]);
+    // Tile order management: preserves shuffle/reorder state across server syncs
+    const tileOrder = usePlayerTileOrder(clientRackState, playerId ? `scrabble:tile-order:${playerId}` : undefined);
+    const displayRackState = tileOrder.displayRack;
+    const toServerRackIndex = useCallback((displayIndex: number) => tileOrder.displayIndexToServerIndex(displayIndex), [tileOrder]);
 
     // Periodically send previews to the server so other players can see our
     // planning placements without committing them. We send every 2s while
@@ -896,13 +909,14 @@ export default function Game() {
 
     // If a rack tile is selected, place it normally (client-side only)
     if (selectedTileIndex !== null && boardToCheck[row][col] === null) {
+      const serverRackIndex = toServerRackIndex(selectedTileIndex);
       const rackToCheck = clientRackState || currentPlayer.rack;
-      const letter = rackToCheck[selectedTileIndex];
+      const letter = rackToCheck[serverRackIndex];
       if (!letter) return;
 
       // Handle blank tile assignment by opening modal
       if (letter === '?') {
-        setBlankAssign({ row, col, rackIndex: selectedTileIndex });
+        setBlankAssign({ row, col, rackIndex: serverRackIndex });
         setIsBlankDialogOpen(true);
         return;
       }
@@ -910,7 +924,7 @@ export default function Game() {
       console.log('[Placement] Placing tile', letter, 'at', row, col);
       setPlacedTiles([...placedTiles, { row, col, letter }]);
       // Track rack index for this placement
-      setTypedSequence(prev => [...prev, { row, col, letter, fromRackIndex: selectedTileIndex, blank: false }]);
+      setTypedSequence(prev => [...prev, { row, col, letter, fromRackIndex: serverRackIndex, blank: false }]);
       setSelectedTileIndex(null);
       playSound('tile.mp3');
       // No server update - client-side only
@@ -963,14 +977,8 @@ export default function Game() {
   const handleReorderRack = async (from: number, to: number) => {
     if (from === to) return;
 
-    // Update visual rack order (local only)
-    setRackView(prev => {
-      const base = prev ? [...prev] : (clientRackState ? [...clientRackState] : []);
-      if (!base || from < 0 || to < 0 || from >= base.length || to >= base.length) return base;
-      const [item] = base.splice(from, 1);
-      base.splice(to, 0, item);
-      return base;
-    });
+    // Use the hook to reorder tiles (preserves order across server syncs)
+    tileOrder.reorderTiles(from, to);
 
     // Update local selected index mapping so selection follows the tile
     setSelectedTileIndex(prev => {
@@ -995,8 +1003,9 @@ export default function Game() {
     const placedEntry = placedTiles.find(t => t.row === fromRow && t.col === fromCol) as any;
     const isBlank = !!tileCell.blank || !!placedEntry?.blank;
 
+    const serverRackIndex = toServerRackIndex(toIndex);
     const rackToCheck = clientRackState || currentPlayer.rack;
-    const rackVal = rackToCheck[toIndex];
+    const rackVal = rackToCheck[serverRackIndex];
 
     // If target rack slot is empty, move board tile into it (client-side only)
     if (rackVal === null) {
@@ -1010,7 +1019,7 @@ export default function Game() {
     // If target rack slot occupied -> swap between board and rack
     // If the rack tile is a blank placeholder, open blank dialog to assign
     if (rackVal === '?') {
-      setBlankAssign({ row: fromRow, col: fromCol, rackIndex: toIndex });
+      setBlankAssign({ row: fromRow, col: fromCol, rackIndex: serverRackIndex });
       setIsBlankDialogOpen(true);
       return;
     }
@@ -1024,10 +1033,8 @@ export default function Game() {
     // Also update typedSequence
     setTypedSequence(prev => {
       const without = prev.filter(t => !(t.row === fromRow && t.col === fromCol));
-      // Find the rack index for the new tile
-      const rackIndex = currentPlayer.rack.findIndex(t => t === rackVal);
-      if (rackIndex !== -1) {
-        return [...without, { row: fromRow, col: fromCol, letter: rackVal, fromRackIndex: rackIndex, blank: false }];
+      if (serverRackIndex >= 0 && serverRackIndex < currentPlayer.rack.length) {
+        return [...without, { row: fromRow, col: fromCol, letter: rackVal, fromRackIndex: serverRackIndex, blank: false }];
       }
       return without;
     });
@@ -1085,9 +1092,9 @@ export default function Game() {
     const currentPlayer = getCurrentPlayer();
     if (!currentPlayer) return;
 
-    // Shuffle is visual only - actual rack state comes from server
-    // We don't need to update server for this as it's just UI reordering
-    console.log('[Shuffle] Shuffling rack (client-side only)');
+    tileOrder.shuffle();
+    setSelectedTileIndex(null);
+    setSelectedDiscardIndices([]);
   };
 
   const handleRecall = async () => {
@@ -1383,7 +1390,7 @@ export default function Game() {
     // Collect discarded letters and empty the selected slots
     const discarded: string[] = [];
     // sort indices so assignment is deterministic
-    const indices = [...selectedDiscardIndices].sort((a, b) => a - b);
+    const indices = Array.from(new Set(selectedDiscardIndices.map(toServerRackIndex))).sort((a, b) => a - b);
     for (const idx of indices) {
       const letter = newPlayer.rack[idx];
       if (letter !== null) {
@@ -1483,6 +1490,7 @@ export default function Game() {
   };
 
   const isCurrentPlayer = gameState?.currentPlayer === playerId;
+  const allPlayersVoiceEnabled = !!gameState?.players?.length && gameState.players.every((player) => !!player.voiceEnabled);
 
   return (
     <div className="min-h-screen bg-background">
@@ -1566,7 +1574,7 @@ export default function Game() {
               ))}
             </div>
             {/* Voice chat controls (global + background component) */}
-            {playerId && <div className="mt-2"><VoiceChat playerId={playerId} voiceVolume={voiceVolume} playerNames={Object.fromEntries((gameState.players||[]).map(p => [p.id, p.name]))} /></div>}
+            {playerId && allPlayersVoiceEnabled && <div className="mt-2"><VoiceChat playerId={playerId} voiceVolume={voiceVolume} playerNames={Object.fromEntries((gameState.players||[]).map(p => [p.id, p.name]))} /></div>}
             {/* Global sound & voice controls in one themed row */}
             <div className="mt-2">
               <div className="flex items-center gap-3">
@@ -1684,7 +1692,8 @@ export default function Game() {
 
                   try {
                     if (data?.source === 'rack') {
-                      const index = data.index as number;
+                      const displayIndex = data.index as number;
+                      const index = toServerRackIndex(displayIndex);
                       const letter = rackToCheck[index];
                       if (!letter) return;
 
@@ -1916,7 +1925,7 @@ export default function Game() {
                 <div>
                   <h2 className="text-lg font-semibold mb-4">Ваши фишки</h2>
                   <TileRack
-                    rack={rackView || clientRackState || getCurrentPlayer()?.rack || []}
+                    rack={displayRackState.length > 0 ? displayRackState : clientRackState || getCurrentPlayer()?.rack || []}
                     selectedTileIndex={selectedTileIndex}
                     selectedIndices={discardMode ? selectedDiscardIndices : undefined}
                     onTileClick={handleTileClick}
