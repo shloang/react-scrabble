@@ -1,19 +1,28 @@
 let wordSet: Set<string> | null = null;
+let wordListLoadPromise: Promise<void> | null = null;
 
 export async function ensureWordListLoaded(): Promise<void> {
   if (wordSet !== null) return;
-  try {
-    const res = await fetch('/api/wordlist');
-    if (!res.ok) {
+  if (wordListLoadPromise) return wordListLoadPromise;
+
+  wordListLoadPromise = (async () => {
+    try {
+      const res = await fetch('/api/wordlist');
+      if (!res.ok) {
+        wordSet = null;
+        return;
+      }
+      const txt = await res.text();
+      const lines = txt.split(/\r?\n/).map(l => l.trim().toLowerCase()).filter(Boolean);
+      wordSet = new Set(lines);
+    } catch (err) {
       wordSet = null;
-      return;
+    } finally {
+      wordListLoadPromise = null;
     }
-    const txt = await res.text();
-    const lines = txt.split(/\r?\n/).map(l => l.trim().toLowerCase()).filter(Boolean);
-    wordSet = new Set(lines);
-  } catch (err) {
-    wordSet = null;
-  }
+  })();
+
+  return wordListLoadPromise;
 }
 
 export function isWordLoaded(): boolean {

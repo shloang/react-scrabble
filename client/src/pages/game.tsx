@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { MOVE_TIME, Player, PlacedTile, GameState, TILE_VALUES } from '@shared/schema';
-import { getGameState, joinGame as joinGameApi, updateGameState, validateWord, sendPreview, initializeGame } from '@/lib/gameApi';
+import { getGameState, joinGame as joinGameApi, updateGameState, validateWord, sendPreview, initializeGame, resetSession as resetSessionApi } from '@/lib/gameApi';
 import { ensureWordListLoaded, isWordLocal } from '@/lib/wordLocal';
 import { extractWordsFromBoard, calculateScore, validatePlacement } from '@/lib/gameLogic';
 import GameBoard from '@/components/GameBoard';
@@ -13,8 +13,8 @@ import JoinGameDialog from '@/components/JoinGameDialog';
 import ValidationMessage from '@/components/ValidationMessage';
 import EndGameScreen from '@/components/EndGameScreen';
 import VoiceChat from '@/components/VoiceChat_new';
+import WordChecker from '@/components/WordChecker';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
 import { CheckCircle, SkipForward, Sun, Moon } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 import { useAudioKeepAlive } from '@/hooks/useAudioKeepAlive';
@@ -52,9 +52,6 @@ export default function Game() {
   const [isValidating, setIsValidating] = useState(false);
   const [isError, setIsError] = useState(false);
   const [joinError, setJoinError] = useState<string | null>(null);
-  const [wordToCheck, setWordToCheck] = useState('');
-  const [isCheckingWord, setIsCheckingWord] = useState(false);
-  const [wordCheckResult, setWordCheckResult] = useState<null | { word: string; valid: boolean; extract?: string | null }>(null);
   const [hasPlayed20SecSound, setHasPlayed20SecSound] = useState(false);
   const [previousCurrentPlayer, setPreviousCurrentPlayer] = useState<string | null>(null);
   const [hasPlayedEndGameSound, setHasPlayedEndGameSound] = useState(false);
@@ -709,27 +706,6 @@ export default function Game() {
     joinMutation.mutate({ name, password });
   };
 
-  const handleCheckWord = async () => {
-    const w = wordToCheck.trim();
-    if (!w) return;
-    setIsCheckingWord(true);
-    setWordCheckResult(null);
-    try {
-      await ensureWordListLoaded();
-      const local = isWordLocal(w.toLowerCase());
-      if (local !== null) {
-        setWordCheckResult({ word: w, valid: local, extract: null });
-      } else {
-        const res = await validateWord(w.toLowerCase());
-        setWordCheckResult({ word: w, valid: res.isValid, extract: res.extract || null });
-      }
-    } catch (err) {
-      setWordCheckResult({ word: w, valid: false, extract: null });
-    } finally {
-      setIsCheckingWord(false);
-    }
-  };
-
   // Session routing/validation is owned by App-level guard.
   useEffect(() => {
     const onKeyDown = async (e: KeyboardEvent) => {
@@ -1088,7 +1064,7 @@ export default function Game() {
   };
 
   const handleShuffle = async () => {
-    if (!gameState || gameState.currentPlayer !== playerId) return;
+    if (!gameState || gameState.gameEnded || gameState.paused) return;
     const currentPlayer = getCurrentPlayer();
     if (!currentPlayer) return;
 
@@ -1478,6 +1454,40 @@ export default function Game() {
     }
   };
 
+  const resetEndedSessionAndGoLobby = async () => {
+    if (!playerId || !gameState?.gameEnded) {
+      try { setLocation('/lobby'); } catch {}
+      return;
+    }
+
+    try {
+      const resp = await resetSessionApi(playerId);
+      if (resp?.gameState) {
+        queryClient.setQueryData(['/api/game'], resp.gameState);
+      } else {
+        queryClient.invalidateQueries({ queryKey: ['/api/game'] });
+      }
+      setShowEndScreen(false);
+      setShowEndScreenMinimized(false);
+      setHasPlayedEndGameSound(false);
+      setPlacedTiles([]);
+      setTypedSequence([]);
+      setSelectedTileIndex(null);
+      setSelectedDiscardIndices([]);
+      setDiscardMode(false);
+      setTimeLeft(MOVE_TIME);
+      lastTurnStartRef.current = Date.now();
+      try { setLocation('/lobby'); } catch {}
+      toast({ title: 'Новая сессия готова', description: 'Прошлая партия сброшена, можно собрать лобби заново' });
+    } catch (err: any) {
+      toast({
+        variant: 'destructive',
+        title: 'Не удалось сбросить сессию',
+        description: err?.message || 'Откройте лобби и попробуйте кнопку сброса сессии',
+      });
+    }
+  };
+
   const handleBackToLobby = async () => {
     if (pendingPatchRef.current.timer) {
       clearTimeout(pendingPatchRef.current.timer as number);
@@ -1485,6 +1495,10 @@ export default function Game() {
     pendingPatchRef.current.board = {};
     pendingPatchRef.current.rack = {};
     pendingPatchRef.current.timer = null;
+    if (gameState?.gameEnded) {
+      await resetEndedSessionAndGoLobby();
+      return;
+    }
     try { setLocation('/lobby'); } catch {}
     toast({ title: 'Вы вернулись в лобби' });
   };
@@ -1523,17 +1537,7 @@ export default function Game() {
                 setShowEndScreen(false);
                 setShowEndScreenMinimized(true);
               }}
-              onNewGame={() => {
-                // Navigate back to lobby page
-                try { setLocation('/lobby'); } catch {}
-                setShowEndScreen(false);
-                setShowEndScreenMinimized(false);
-                setHasPlayedEndGameSound(false);
-                setTimeLeft(MOVE_TIME);
-                lastTurnStartRef.current = Date.now();
-                try { refetch(); } catch {}
-                toast({ title: 'Возврат в лобби' });
-              }}
+              onNewGame={resetEndedSessionAndGoLobby}
             />
           )}
 
@@ -1865,62 +1869,7 @@ export default function Game() {
                   </div>
                 )}
 
-                <div className="mt-4">
-                  <h3 className="text-sm font-semibold mb-2">Проверить слово</h3>
-                  <div className="flex gap-2">
-                    <Input
-                      placeholder="Введите слово"
-                      value={wordToCheck}
-                      onChange={(e) => setWordToCheck(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          e.preventDefault();
-                          handleCheckWord();
-                        }
-                      }}
-                      data-testid="input-check-word"
-                    />
-                    <Button
-                      onClick={handleCheckWord}
-                      disabled={isCheckingWord || !!gameState?.gameEnded}
-                    >
-                      {isCheckingWord ? 'Проверка...' : 'Проверить'}
-                    </Button>
-                  </div>
-                  {wordCheckResult && (
-                    <div className={`mt-2 text-sm font-medium ${wordCheckResult.valid ? 'text-green-700' : 'text-red-700'}`} data-testid="check-result">
-                      <div>{wordCheckResult.word} — {wordCheckResult.valid ? 'В словаре' : 'Не найдено'}</div>
-                      {wordCheckResult.extract ? (
-                        <>
-                          <div className="mt-1 text-xs text-muted-foreground whitespace-pre-wrap">{wordCheckResult.extract}</div>
-                          <div className="mt-1 text-xs">
-                            <a
-                              href={`https://ru.wiktionary.org/wiki/${encodeURIComponent(wordCheckResult.word.toLowerCase())}`}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-sm text-primary underline"
-                              data-testid="link-more"
-                            >
-                              Подробнее
-                            </a>
-                          </div>
-                        </>
-                      ) : (
-                        <div className="mt-1 text-xs">
-                          <a
-                            href={`https://ru.wiktionary.org/wiki/${encodeURIComponent(wordCheckResult.word)}`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-sm text-primary underline"
-                            data-testid="link-more"
-                          >
-                            Подробнее
-                          </a>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
+                <WordChecker disabled={!!gameState?.gameEnded} />
 
                 <div>
                   <h2 className="text-lg font-semibold mb-4">Ваши фишки</h2>
@@ -1934,7 +1883,9 @@ export default function Game() {
                     onReorder={handleReorderRack}
                     onDropFromBoard={handleDropFromBoard}
                     // Disable interactions when the game has ended
-                    canInteract={!isJoining && !gameState?.gameEnded}
+                    canInteract={!isJoining && !gameState?.gameEnded && !gameState?.paused}
+                    canShuffle={!isJoining && !gameState?.gameEnded && !gameState?.paused}
+                    isPaused={!!gameState?.paused}
                   />
                 </div>
                   <div className="flex flex-col gap-2">

@@ -10,6 +10,8 @@ interface TileRackProps {
   onShuffle: () => void;
   onRecall: () => void;
   canInteract: boolean;
+  canShuffle?: boolean;
+  isPaused?: boolean;
   onReorder?: (from: number, to: number) => void;
   onDropFromBoard?: (fromRow: number, fromCol: number, toIndex: number) => void;
 }
@@ -22,12 +24,14 @@ export default function TileRack({
   onShuffle, 
   onRecall,
   canInteract,
+  canShuffle = canInteract,
+  isPaused = false,
   onReorder,
   onDropFromBoard
 }: TileRackProps) {
   return (
     <div className="w-full" data-testid="tile-rack">
-      <div className="grid grid-cols-7 gap-2 mb-4">
+      <div className={`grid grid-cols-7 gap-2 mb-4 transition-opacity ${isPaused ? 'opacity-35 grayscale' : ''}`} aria-disabled={isPaused}>
         {rack.map((letter, index) => (
           <div
             key={index}
@@ -112,7 +116,7 @@ export default function TileRack({
           variant="outline"
           size="default"
           onClick={onShuffle}
-          disabled={!canInteract}
+          disabled={!canShuffle}
           className="flex-1"
           data-testid="button-shuffle"
         >
