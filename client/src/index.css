@@ -301,6 +301,7 @@ html {
 .history-scroll {
   scrollbar-width: thin;
   scrollbar-color: hsl(var(--primary)) hsl(var(--card));
+  scrollbar-gutter: stable;
 }
 .history-scroll::-webkit-scrollbar {
   height: 8px;
@@ -354,5 +355,11 @@ html {
     background: rgba(255,255,255,0.95);
     box-shadow: 0 6px 18px rgba(0,0,0,0.12);
     font-weight: 700;
+  }
+
+  .drag-lift-image {
+    opacity: 0.96;
+    transform: rotate(-2deg) scale(1.04);
+    filter: drop-shadow(0 16px 20px rgba(0,0,0,0.28));
   }
 }

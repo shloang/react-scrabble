@@ -22,6 +22,15 @@ import { usePlayerTileOrder } from '@/hooks/usePlayerTileOrder';
 import { useLocation } from 'wouter';
 import { getStats, incrementWin, incrementLoss, getAllStats } from '@/lib/playerStats';
 
+const EMPTY_PREVIEWS: Record<string, PlacedTile[]> = {};
+
+function useEventCallback<T extends (...args: any[]) => any>(handler: T): T {
+  const handlerRef = useRef(handler);
+  handlerRef.current = handler;
+
+  return useCallback(((...args: Parameters<T>) => handlerRef.current(...args)) as T, []);
+}
+
 export default function Game() {
   const [playerId, setPlayerId] = useState<string | null>(() => {
     try { return localStorage.getItem('playerId'); } catch { return null; }
@@ -44,7 +53,6 @@ export default function Game() {
     status: 'valid' | 'invalid' | 'checking';
   }[]>([]);
   const [potentialScore, setPotentialScore] = useState<number | null>(null);
-  const [timeLeft, setTimeLeft] = useState(MOVE_TIME);
   const [isDark, setIsDark] = useState<boolean>(() => {
     try { return localStorage.getItem('dark') === '1'; } catch { return false; }
   });
@@ -52,7 +60,6 @@ export default function Game() {
   const [isValidating, setIsValidating] = useState(false);
   const [isError, setIsError] = useState(false);
   const [joinError, setJoinError] = useState<string | null>(null);
-  const [hasPlayed20SecSound, setHasPlayed20SecSound] = useState(false);
   const [previousCurrentPlayer, setPreviousCurrentPlayer] = useState<string | null>(null);
   const [hasPlayedEndGameSound, setHasPlayedEndGameSound] = useState(false);
   const { toast } = useToast();
@@ -85,22 +92,16 @@ export default function Game() {
   const lastSoundRef = useRef<{ key: string; ts: number } | null>(null);
   const [soundVolume, setSoundVolume] = useState<number>(0.5);
   const [voiceVolume, setVoiceVolume] = useState<number>(1);
-  const [voicePeerState, setVoicePeerState] = useState<{ peerVolumes: Record<string, number>; peerMuted: Record<string, boolean>; peerStatuses: Record<string, string>; levels: Record<string, number> }>({ peerVolumes: {}, peerMuted: {}, peerStatuses: {}, levels: {} });
-
-  const handleVoiceStateUpdate = useCallback((s: { peerVolumes: Record<string, number>; peerMuted: Record<string, boolean>; peerStatuses: Record<string, string>; levels: Record<string, number> }) => {
-    setVoicePeerState(prev => ({
-      peerVolumes: { ...prev.peerVolumes, ...s.peerVolumes },
-      peerMuted: { ...prev.peerMuted, ...s.peerMuted },
-      peerStatuses: { ...prev.peerStatuses, ...s.peerStatuses },
-      levels: { ...prev.levels, ...s.levels }
-    }));
-  }, [setVoicePeerState]);
+  const [isPageVisible, setIsPageVisible] = useState(() => {
+    if (typeof document === 'undefined') return true;
+    return document.visibilityState === 'visible';
+  });
 
   // Initialize AudioContext keepalive to prevent browser suspension after 30+ minutes
   const audioCacheMapRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const audioKeepAlive = useAudioKeepAlive(audioCacheMapRef.current, { checkInterval: 10000, debug: false });
 
-  const playSound = (filename: string) => {
+  const playSound = useCallback((filename: string) => {
     try {
       const key = filename;
       const now = Date.now();
@@ -133,7 +134,7 @@ export default function Game() {
     } catch (err) {
       console.error('Failed to load sound:', err);
     }
-  };
+  }, [audioKeepAlive, soundVolume]);
 
   // Update cached audio elements when soundVolume changes
   useEffect(() => {
@@ -144,10 +145,25 @@ export default function Game() {
     }
   }, [soundVolume]);
 
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      setIsPageVisible(document.visibilityState === 'visible');
+    };
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, []);
+
   // Poll for game state
   const { data: gameState, refetch } = useQuery<GameState | null>({
     queryKey: ['/api/game'],
-    refetchInterval: 2000,
+    refetchInterval: (query) => {
+      const latestGameState = query.state.data as GameState | null | undefined;
+      if (latestGameState?.gameEnded) return false;
+      return isPageVisible ? 2000 : 15000;
+    },
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false,
     enabled: !isJoining
   });
 
@@ -186,7 +202,6 @@ export default function Game() {
       setJoinError(null);
       setIsJoining(false);
       // do not navigate away after join; keep user on the Game page
-      setTimeLeft(MOVE_TIME);
       refetch();
     },
     onError: (error: any) => {
@@ -353,7 +368,7 @@ export default function Game() {
   
 
     // Derived client-side preview state and helpers
-    const getCurrentPlayer = () => gameState?.players?.find(p => p.id === playerId) || null;
+    const getCurrentPlayer = useCallback(() => gameState?.players?.find(p => p.id === playerId) || null, [gameState?.players, playerId]);
 
     const clientBoardState = useMemo(() => {
       if (!gameState) return null;
@@ -405,7 +420,7 @@ export default function Game() {
       }
 
       return rack;
-    }, [gameState, playerId, typedSequence]);
+    }, [gameState, playerId, placedTiles, typedSequence]);
 
     // Tile order management: preserves shuffle/reorder state across server syncs
     const tileOrder = usePlayerTileOrder(clientRackState, playerId ? `scrabble:tile-order:${playerId}` : undefined);
@@ -413,32 +428,27 @@ export default function Game() {
     const toServerRackIndex = useCallback((displayIndex: number) => tileOrder.displayIndexToServerIndex(displayIndex), [tileOrder]);
 
     // Periodically send previews to the server so other players can see our
-    // planning placements without committing them. We send every 2s while
-    // the player has local placedTiles; when there are none we clear the
-    // preview on the server for this player.
+    // planning placements without committing them.
     useEffect(() => {
+      if (!playerId) return;
       let stopped = false;
-        if (!playerId) return;
-        const send = async () => {
-          try {
-            // Defensive: ensure local player exists in authoritative state before
-            // attempting to send previews (avoids server/logic races when the
-            // local player isn't yet present after a start transition).
-            const cp = getCurrentPlayer();
-            if (!cp) return;
-            // Only send when we have placed tiles (or to clear them)
-            await sendPreview(playerId, placedTiles.map(t => ({ row: t.row, col: t.col, letter: t.letter, blank: !!t.blank })));
-          } catch (err) {
-            // ignore network errors for now
-          }
-        };
+      const payload = placedTiles.map(t => ({ row: t.row, col: t.col, letter: t.letter, blank: !!t.blank }));
 
-      // Send immediately once, then every 2s only while placedTiles exist.
+      const send = async () => {
+        try {
+          const cp = getCurrentPlayer();
+          if (!cp || stopped) return;
+          await sendPreview(playerId, payload);
+        } catch (err) {
+          // ignore network errors for preview updates
+        }
+      };
+
       let interval: number | null = null;
       (async () => {
         await send();
         if (stopped) return;
-        if (placedTiles.length > 0) {
+        if (payload.length > 0) {
           interval = window.setInterval(() => { send(); }, 2000) as unknown as number;
         }
       })();
@@ -446,12 +456,17 @@ export default function Game() {
       return () => {
         stopped = true;
         if (interval) clearInterval(interval as number);
-        // On unmount/cleanup ensure server preview is cleared for this player
+      };
+    }, [playerId, placedTiles, getCurrentPlayer]);
+
+    useEffect(() => {
+      if (!playerId) return;
+      return () => {
         (async () => {
           try { await sendPreview(playerId, []); } catch (err) { /* ignore */ }
         })();
       };
-    }, [playerId, placedTiles]);
+    }, [playerId]);
 
     // Compute last move positions (server authoritative) to highlight those tiles
     const lastMovePositions = useMemo(() => {
@@ -616,61 +631,35 @@ export default function Game() {
     }
   }, [gameState?.moves?.length, gameState?.currentPlayer, gameState?.turnStart]);
 
-  // Continuous timer for everyone: compute remaining time by comparing now to the
-  // last-turn start timestamp (derived from the last move). This keeps the visible
-  // countdown running for all players, not only the local player.
-  useEffect(() => {
-    if (!gameState) return;
-    // If the game ended, show 0
-    if (gameState.gameEnded) {
-      setTimeLeft(0);
-      return;
+  const timerTurnStart = useMemo(() => {
+    if (!gameState) return null;
+    if (typeof gameState.turnStart === 'number' && gameState.turnStart) {
+      return gameState.turnStart;
     }
 
-    // Compute remaining based on server `turnStart` and `pausedAt` when paused
-    const computeRemainingAt = (nowMs: number) => {
-      const startMs = (typeof gameState.turnStart === 'number' && gameState.turnStart) ? gameState.turnStart : (lastTurnStartRef.current ?? nowMs);
-      // if paused, use pausedAt as the reference moment to compute elapsed
-      const refMs = (gameState.paused && typeof gameState.pausedAt === 'number' && gameState.pausedAt) ? gameState.pausedAt : nowMs;
-      const elapsed = Math.floor((refMs - startMs) / 1000);
-      return Math.max(0, MOVE_TIME - elapsed);
-    };
-
-    // If paused, set a static remaining and don't start ticking
-    if (gameState.paused) {
-      const remaining = computeRemainingAt(Date.now());
-      setTimeLeft(remaining);
-      return;
+    const moves = gameState.moves || [];
+    if (moves.length > 0) {
+      return moves[moves.length - 1].timestamp;
     }
 
-    let cancelled = false;
-    const tick = () => {
-      if (cancelled) return;
-      const now = Date.now();
-      const remaining = computeRemainingAt(now);
+    return lastTurnStartRef.current;
+  }, [gameState?.moves, gameState?.turnStart]);
 
-      setTimeLeft(prev => {
-        if (gameState.currentPlayer === playerId) {
-          if (remaining <= 20 && !hasPlayed20SecSound) {
-            playSound('20sec.mp3');
-            setHasPlayed20SecSound(true);
-          }
-        }
-        return remaining;
-      });
+  const timerTurnKey = `${gameState?.currentPlayer ?? 'none'}:${timerTurnStart ?? 'none'}:${gameState?.turn ?? 0}`;
 
-      if (remaining <= 0 && gameState.currentPlayer === playerId) {
-        handleSkipTurn();
-        // don't manipulate lastTurnStartRef — server will provide authoritative state
-      }
-    };
+  const handleTimerWarning = useCallback(() => {
+    if (gameState?.currentPlayer === playerId) {
+      playSound('20sec.mp3');
+    }
+  }, [gameState?.currentPlayer, playerId, soundVolume]);
 
-    tick();
-    const id = setInterval(tick, 1000);
-    return () => { cancelled = true; clearInterval(id); };
-  }, [gameState?.gameEnded, gameState?.paused, gameState?.pausedAt, gameState?.turnStart, gameState?.currentPlayer, playerId, hasPlayed20SecSound]);
+  const handleTimerExpired = useCallback(() => {
+    if (gameState?.currentPlayer === playerId) {
+      handleSkipTurn();
+    }
+  }, [gameState?.currentPlayer, playerId]);
 
-  // Note: server now manages `pausedAt` and `turnStart`; client relies on those fields.
+  // Note: server now manages `pausedAt` and `turnStart`; GameTimer renders the local countdown.
 
   // Keyboard shortcut: press 'E' to toggle the end-screen when a game has ended
   useEffect(() => {
@@ -875,7 +864,7 @@ export default function Game() {
   // Listen for rack reorder events dispatched from TileRack
   // (no global event usage now)
 
-  const handleSquareClick = async (row: number, col: number) => {
+  const handleSquareClick = useCallback(async (row: number, col: number) => {
           if (!gameState) return;
     
     const currentPlayer = getCurrentPlayer();
@@ -935,9 +924,9 @@ export default function Game() {
       setTypedSequence(prev => prev.filter(t => !(t.row === row && t.col === col)));
       // No server update - client-side only
     }
-  };
+  }, [clientBoardState, clientRackState, gameState, getCurrentPlayer, placedTiles, playSound, selectedTileIndex, toServerRackIndex, typingCursor]);
 
-  const handleTileClick = (index: number) => {
+  const handleTileClick = useCallback((index: number) => {
     if (discardMode) {
       setSelectedDiscardIndices(prev => {
         if (prev.includes(index)) return prev.filter(i => i !== index);
@@ -947,10 +936,10 @@ export default function Game() {
     }
 
     setSelectedTileIndex(selectedTileIndex === index ? null : index);
-  };
+  }, [discardMode, selectedTileIndex]);
 
   // Reorder rack indices (drag within rack) - client-side only, no server update
-  const handleReorderRack = async (from: number, to: number) => {
+  const handleReorderRack = useCallback(async (from: number, to: number) => {
     if (from === to) return;
 
     // Use the hook to reorder tiles (preserves order across server syncs)
@@ -964,10 +953,10 @@ export default function Game() {
       if (from > to && prev >= to && prev < from) return prev + 1;
       return prev;
     });
-  };
+  }, [tileOrder]);
 
   // Drop a placed board tile into a rack slot (or swap) - client-side only
-  const handleDropFromBoard = async (fromRow: number, fromCol: number, toIndex: number) => {
+  const handleDropFromBoard = useCallback(async (fromRow: number, fromCol: number, toIndex: number) => {
     if (!gameState) return;
     const currentPlayer = getCurrentPlayer();
     if (!currentPlayer) return;
@@ -1014,7 +1003,132 @@ export default function Game() {
       }
       return without;
     });
-  };
+  }, [clientBoardState, clientRackState, gameState, getCurrentPlayer, placedTiles, toServerRackIndex]);
+
+  const handleBoardTileDrop = useCallback(async (row: number, col: number, data: any) => {
+    if (!gameState) return;
+
+    const currentPlayer = getCurrentPlayer();
+    if (!currentPlayer) return;
+
+    const boardToCheck = clientBoardState || gameState.board;
+    const rackToCheck = clientRackState || currentPlayer.rack;
+
+    try {
+      if (data?.source === 'rack') {
+        const displayIndex = data.index as number;
+        const index = toServerRackIndex(displayIndex);
+        const letter = rackToCheck[index];
+        if (!letter) return;
+
+        const targetLetter = boardToCheck[row][col];
+
+        // If target is empty -> normal placement (or blank dialog) - client-side only
+        if (targetLetter === null) {
+          if (letter === '?') {
+            setBlankAssign({ row, col, rackIndex: index });
+            setIsBlankDialogOpen(true);
+            return;
+          }
+          setPlacedTiles([...placedTiles, { row, col, letter }]);
+          setTypedSequence(prev => [...prev, { row, col, letter, fromRackIndex: index, blank: false }]);
+          setSelectedTileIndex(null);
+          if (gameState.currentPlayer === playerId) playSound('tile.mp3');
+          return;
+        }
+
+        // If target occupied -> check if it's a tile placed this turn (can swap) or old tile (cannot replace)
+        const replacedPlaced = placedTiles.find(t => t.row === row && t.col === col);
+        if (!replacedPlaced) {
+          // Target has an old tile from previous turns - cannot replace it
+          return;
+        }
+
+        // Target has a tile placed this turn -> swap: place rack tile on board, move replaced tile into rack slot (client-side only)
+        // update placedTiles: remove replaced placed entry if existed, and add new placed tile for the rack tile
+        setPlacedTiles(prev => {
+          const next = prev.filter(t => !(t.row === row && t.col === col));
+          // if placing a non-blank from rack, mark it as placed
+          const isBlankPlaced = letter === '?';
+          next.push({ row, col, letter: isBlankPlaced ? (letter as string) : letter } as any);
+          return next;
+        });
+
+        // Update typedSequence
+        setTypedSequence(prev => {
+          const next = prev.filter(t => !(t.row === row && t.col === col));
+          if (letter !== '?') {
+            next.push({ row, col, letter, fromRackIndex: index, blank: false });
+          }
+          return next;
+        });
+
+        // If rack tile was '?' we should open blank dialog to assign letter at this position
+        if (letter === '?') {
+          setBlankAssign({ row, col, rackIndex: index });
+          setIsBlankDialogOpen(true);
+          return;
+        }
+
+        setSelectedTileIndex(null);
+        return;
+      }
+
+      if (data?.source === 'board') {
+        const fromRow = data.fromRow as number;
+        const fromCol = data.fromCol as number;
+
+        const tile = boardToCheck[fromRow][fromCol];
+        if (!tile) return;
+
+        const targetTile = boardToCheck[row][col];
+
+        // Check if the source tile was placed this turn
+        const movingPlaced = placedTiles.find(t => t.row === fromRow && t.col === fromCol);
+        if (!movingPlaced) {
+          // Cannot move tiles that were placed in previous turns
+          return;
+        }
+
+        // If target is empty => move (only if tile was placed this turn) - client-side only
+        if (targetTile === null) {
+          const newPlaced = placedTiles.map(t => t.row === fromRow && t.col === fromCol ? { ...t, row, col } : t);
+          setPlacedTiles(newPlaced as any);
+          // Update typedSequence
+          setTypedSequence(prev => prev.map(t => t.row === fromRow && t.col === fromCol ? { ...t, row, col } : t));
+          return;
+        }
+
+        // target occupied -> check if target tile was also placed this turn (can swap)
+        const targetPlaced = placedTiles.find(t => t.row === row && t.col === col);
+        if (!targetPlaced) {
+          // Target has an old tile from previous turns - cannot swap with it
+          return;
+        }
+
+        // Both tiles were placed this turn -> swap both on field (client-side only)
+        setPlacedTiles(prev => {
+          const next = prev.map(t => {
+            if (t.row === fromRow && t.col === fromCol) return { ...t, row: row, col: col };
+            if (t.row === row && t.col === col) return { ...t, row: fromRow, col: fromCol };
+            return t;
+          });
+          return next as any;
+        });
+
+        // Update typedSequence
+        setTypedSequence(prev => {
+          return prev.map(t => {
+            if (t.row === fromRow && t.col === fromCol) return { ...t, row: row, col: col };
+            if (t.row === row && t.col === col) return { ...t, row: fromRow, col: fromCol };
+            return t;
+          });
+        });
+      }
+    } catch (err) {
+      console.error('[Drop] error', err);
+    }
+  }, [clientBoardState, clientRackState, gameState, getCurrentPlayer, placedTiles, playerId, playSound, toServerRackIndex]);
 
   const handleConfirmBlank = async (assigned: string) => {
     if (!blankAssign || !gameState) {
@@ -1063,7 +1177,7 @@ export default function Game() {
     setBlankAssign(null);
   };
 
-  const handleShuffle = async () => {
+  const handleShuffle = useCallback(async () => {
     if (!gameState || gameState.gameEnded || gameState.paused) return;
     const currentPlayer = getCurrentPlayer();
     if (!currentPlayer) return;
@@ -1071,9 +1185,9 @@ export default function Game() {
     tileOrder.shuffle();
     setSelectedTileIndex(null);
     setSelectedDiscardIndices([]);
-  };
+  }, [gameState, getCurrentPlayer, tileOrder]);
 
-  const handleRecall = async () => {
+  const handleRecall = useCallback(async () => {
     if (!gameState || placedTiles.length === 0) return;
     if (gameState.paused) {
       toast({ variant: 'destructive', title: 'Игра приостановлена', description: 'Нельзя изменять состояние во время паузы' });
@@ -1119,7 +1233,7 @@ export default function Game() {
     setTypedSequence([]);
     setSelectedTileIndex(null);
     await updateMutation.mutateAsync(newState);
-  };
+  }, [gameState, placedTiles, playerId, toast, typedSequence, updateMutation]);
 
   const handleSubmitMove = async () => {
     if (!gameState || gameState.currentPlayer !== playerId || placedTiles.length === 0) return;
@@ -1257,7 +1371,6 @@ export default function Game() {
       setPlacedTiles([]);
       setTypedSequence([]);
       setSelectedTileIndex(null);
-      setTimeLeft(MOVE_TIME);
       setIsValidating(false);
 
       setTimeout(() => {
@@ -1323,7 +1436,6 @@ export default function Game() {
     });
 
     await updateMutation.mutateAsync(newState);
-    setTimeLeft(MOVE_TIME);
   };
 
   const handleStartDiscard = () => {
@@ -1422,7 +1534,6 @@ export default function Game() {
       setSelectedTileIndex(null);
       setPlacedTiles([]);
       setTypedSequence([]);
-      setTimeLeft(MOVE_TIME);
     } catch (err) {
       // keep discard mode open on error
       console.error('[Discard] failed', err);
@@ -1461,7 +1572,7 @@ export default function Game() {
     }
 
     try {
-      const resp = await resetSessionApi(playerId);
+      const resp = await resetSessionApi(playerId, { preservePlayers: true });
       if (resp?.gameState) {
         queryClient.setQueryData(['/api/game'], resp.gameState);
       } else {
@@ -1475,7 +1586,6 @@ export default function Game() {
       setSelectedTileIndex(null);
       setSelectedDiscardIndices([]);
       setDiscardMode(false);
-      setTimeLeft(MOVE_TIME);
       lastTurnStartRef.current = Date.now();
       try { setLocation('/lobby'); } catch {}
       toast({ title: 'Новая сессия готова', description: 'Прошлая партия сброшена, можно собрать лобби заново' });
@@ -1504,10 +1614,24 @@ export default function Game() {
   };
 
   const isCurrentPlayer = gameState?.currentPlayer === playerId;
-  const allPlayersVoiceEnabled = !!gameState?.players?.length && gameState.players.every((player) => !!player.voiceEnabled);
+  const allPlayersVoiceEnabled = useMemo(
+    () => !!gameState?.players?.length && gameState.players.every((player) => !!player.voiceEnabled),
+    [gameState?.players]
+  );
+  const voicePlayerNames = useMemo(
+    () => Object.fromEntries((gameState?.players || []).map(p => [p.id, p.name])),
+    [gameState?.players]
+  );
+  const stableHandleSquareClick = useEventCallback(handleSquareClick);
+  const stableHandleBoardTileDrop = useEventCallback(handleBoardTileDrop);
+  const stableHandleTileClick = useEventCallback(handleTileClick);
+  const stableHandleShuffle = useEventCallback(handleShuffle);
+  const stableHandleRecall = useEventCallback(handleRecall);
+  const stableHandleReorderRack = useEventCallback(handleReorderRack);
+  const stableHandleDropFromBoard = useEventCallback(handleDropFromBoard);
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="min-h-[100svh] bg-background">
       {gameState?.paused && (
         <div className="fixed top-0 left-0 right-0 bg-yellow-100 border-b border-yellow-300 text-yellow-900 p-3 z-40 flex items-center justify-center">
           <div className="text-sm font-medium">Приостановлено {gameState.pausedBy ? `пользователем ${ (gameState.players || []).find(p => p.id === gameState.pausedBy)?.name ?? '' }` : ''}</div>
@@ -1558,33 +1682,30 @@ export default function Game() {
 
           {/* Lobby moved to a separate page at /lobby */}
 
-          <div className="h-screen flex flex-col lg:flex-row gap-4 p-4">
-          <aside className="lg:w-72 flex flex-col gap-4">
+          <div className="min-h-[100svh] lg:h-[100dvh] flex flex-col lg:flex-row gap-4 p-4 overflow-x-hidden lg:overflow-hidden">
+          <aside className="lg:w-72 lg:flex-none flex flex-col gap-3 min-w-0 lg:min-h-0 lg:h-full">
             <h1 className="text-2xl font-bold">Игроки</h1>
-            <div className="flex flex-row gap-2 overflow-x-auto">
+            <div className="flex flex-row gap-2 overflow-x-auto shrink-0">
               {(gameState?.players || []).map((player, index) => (
                 <PlayerCard
                   key={player.id}
                   player={player}
                   isCurrentPlayer={player.id === gameState.currentPlayer}
                   playerIndex={index}
-                  voiceMuted={voicePeerState.peerMuted[player.id]}
-                  voiceVolume={voicePeerState.peerVolumes[player.id]}
-                  voiceLevel={voicePeerState.levels[player.id]}
-                  voiceStatus={voicePeerState.peerStatuses[player.id]}
-                  onToggleMute={() => setVoicePeerState(prev => ({ ...prev, peerMuted: { ...prev.peerMuted, [player.id]: !prev.peerMuted[player.id] } }))}
-                  onVolumeChange={(v) => setVoicePeerState(prev => ({ ...prev, peerVolumes: { ...prev.peerVolumes, [player.id]: v } }))}
                 />
               ))}
             </div>
             {/* Voice chat controls (global + background component) */}
-            {playerId && allPlayersVoiceEnabled && <div className="mt-2"><VoiceChat playerId={playerId} voiceVolume={voiceVolume} playerNames={Object.fromEntries((gameState.players||[]).map(p => [p.id, p.name]))} /></div>}
-            {/* Global sound & voice controls in one themed row */}
-            <div className="mt-2">
-              <div className="flex items-center gap-3">
-                <div className="flex-1">
-                  <div className="text-sm font-medium">Sound</div>
-                  <div className="flex items-center gap-2 mt-1">
+            {playerId && allPlayersVoiceEnabled && <div className="mt-1 shrink-0"><VoiceChat playerId={playerId} voiceVolume={voiceVolume} playerNames={voicePlayerNames} /></div>}
+            {/* Global sound & voice controls */}
+            <div className="mt-1 shrink-0 rounded-md border bg-card/40 p-2">
+              <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+                <div>
+                  <div className="flex items-center justify-between gap-2 text-sm font-medium">
+                    <span>Sound</span>
+                    <span className="text-xs tabular-nums text-muted-foreground">{Math.round(soundVolume * 100)}%</span>
+                  </div>
+                  <div className="mt-1">
                     <input
                       type="range"
                       min={0}
@@ -1593,13 +1714,15 @@ export default function Game() {
                       onChange={(e) => setSoundVolume(Math.max(0, Math.min(100, Number(e.target.value))) / 100)}
                       className="w-full h-2 accent-primary bg-transparent"
                     />
-                    <div className="text-xs w-8 text-right">{Math.round(soundVolume * 100)}%</div>
                   </div>
                 </div>
 
-                <div className="flex-1">
-                  <div className="text-sm font-medium">Voice</div>
-                  <div className="flex items-center gap-2 mt-1">
+                <div>
+                  <div className="flex items-center justify-between gap-2 text-sm font-medium">
+                    <span>Voice</span>
+                    <span className="text-xs tabular-nums text-muted-foreground">{Math.round(voiceVolume * 100)}%</span>
+                  </div>
+                  <div className="mt-1">
                     <input
                       type="range"
                       min={0}
@@ -1608,14 +1731,13 @@ export default function Game() {
                       onChange={(e) => setVoiceVolume(Math.max(0, Math.min(100, Number(e.target.value))) / 100)}
                       className="w-full h-2 accent-primary bg-transparent"
                     />
-                    <div className="text-xs w-8 text-right">{Math.round(voiceVolume * 100)}%</div>
                   </div>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="col-span-2 grid grid-cols-2 gap-2">
                   <button
                     onClick={handleTogglePause}
                     disabled={!!gameState?.gameEnded}
-                    className={`px-3 py-1 rounded hover:bg-muted/10 ${gameState?.paused ? 'bg-yellow-500 text-white' : 'bg-transparent'}`}
+                    className={`px-3 py-1 rounded border hover:bg-muted/10 ${gameState?.paused ? 'bg-yellow-500 text-white' : 'bg-transparent'}`}
                     aria-pressed={!!gameState?.paused}
                     title={gameState?.paused ? `Resume (paused by ${gameState.pausedBy ?? 'someone'})` : 'Pause game'}
                   >
@@ -1631,9 +1753,9 @@ export default function Game() {
                 </div>
               </div>
             </div>
-            <div className="mt-4">
+            <div className="mt-2 flex flex-col min-h-0 lg:flex-1">
               <h2 className="text-lg font-semibold">История ходов</h2>
-              <div className="mt-2 flex flex-col gap-2 max-h-[30vh] overflow-auto history-scroll">
+              <div className="mt-2 flex flex-col gap-2 max-h-[30vh] lg:max-h-none lg:flex-1 lg:min-h-0 overflow-auto history-scroll pr-1">
                 {(gameState.moves || []).slice().reverse().map((m, idx) => (
                   <div key={`${m.playerId}-${m.timestamp}-${idx}`} className="p-2 rounded border bg-card">
                     <div className="flex items-center justify-between">
@@ -1670,160 +1792,42 @@ export default function Game() {
             </div>
           </aside>
 
-          <main className="flex-1 flex flex-col items-center justify-center gap-4 relative">
+          <main className="flex-1 min-w-0 min-h-0 flex flex-col items-center justify-start lg:justify-center gap-3 relative overflow-hidden">
             <ValidationMessage
               message={validationMessage}
               isValidating={isValidating}
               isError={isError}
             />
             {/* placedWordStatuses moved to sidebar below timer */}
+            <div className="w-full flex-1 min-h-0 flex items-center justify-center">
               <GameBoard
                 board={clientBoardState || gameState.board}
                 placedTiles={placedTiles}
                 typingCursor={typingCursor}
                 placedWordStatuses={placedWordStatuses}
                 lastMovePositions={lastMovePositions}
-                previews={gameState?.previews || {}}
-                onSquareClick={handleSquareClick}
-                onTileDrop={async (row: number, col: number, data: any) => {
-                  if (!gameState) return;
-
-                  const currentPlayer = getCurrentPlayer();
-                  if (!currentPlayer) return;
-
-                  const boardToCheck = clientBoardState || gameState.board;
-                  const rackToCheck = clientRackState || currentPlayer.rack;
-
-                  try {
-                    if (data?.source === 'rack') {
-                      const displayIndex = data.index as number;
-                      const index = toServerRackIndex(displayIndex);
-                      const letter = rackToCheck[index];
-                      if (!letter) return;
-
-                      const targetLetter = boardToCheck[row][col];
-
-                      // If target is empty -> normal placement (or blank dialog) - client-side only
-                      if (targetLetter === null) {
-                        if (letter === '?') {
-                          setBlankAssign({ row, col, rackIndex: index });
-                          setIsBlankDialogOpen(true);
-                          return;
-                        }
-                        setPlacedTiles([...placedTiles, { row, col, letter }]);
-                        setTypedSequence(prev => [...prev, { row, col, letter, fromRackIndex: index, blank: false }]);
-                        setSelectedTileIndex(null);
-                        if (isCurrentPlayer) playSound('tile.mp3');
-                        return;
-                      }
-
-                      // If target occupied -> check if it's a tile placed this turn (can swap) or old tile (cannot replace)
-                      const replacedPlaced = placedTiles.find(t => t.row === row && t.col === col);
-                      if (!replacedPlaced) {
-                        // Target has an old tile from previous turns - cannot replace it
-                        return;
-                      }
-
-                      // Target has a tile placed this turn -> swap: place rack tile on board, move replaced tile into rack slot (client-side only)
-                      const replaced = targetLetter;
-                      const replacedIsBlank = !!replacedPlaced?.blank;
-
-                      // update placedTiles: remove replaced placed entry if existed, and add new placed tile for the rack tile
-                      setPlacedTiles(prev => {
-                        const next = prev.filter(t => !(t.row === row && t.col === col));
-                        // if placing a non-blank from rack, mark it as placed
-                        const isBlankPlaced = letter === '?';
-                        next.push({ row, col, letter: isBlankPlaced ? (letter as string) : letter } as any);
-                        return next;
-                      });
-
-                      // Update typedSequence
-                      setTypedSequence(prev => {
-                        const next = prev.filter(t => !(t.row === row && t.col === col));
-                        if (letter !== '?') {
-                          next.push({ row, col, letter, fromRackIndex: index, blank: false });
-                        }
-                        return next;
-                      });
-
-                      // If rack tile was '?' we should open blank dialog to assign letter at this position
-                      if (letter === '?') {
-                        setBlankAssign({ row, col, rackIndex: index });
-                        setIsBlankDialogOpen(true);
-                        return;
-                      }
-
-                      setSelectedTileIndex(null);
-                      return;
-                    }
-
-                    if (data?.source === 'board') {
-                      const fromRow = data.fromRow as number;
-                      const fromCol = data.fromCol as number;
-
-                      const tile = boardToCheck[fromRow][fromCol];
-                      if (!tile) return;
-
-                      const targetTile = boardToCheck[row][col];
-
-                      // Check if the source tile was placed this turn
-                      const movingPlaced = placedTiles.find(t => t.row === fromRow && t.col === fromCol);
-                      if (!movingPlaced) {
-                        // Cannot move tiles that were placed in previous turns
-                        return;
-                      }
-
-                      // If target is empty => move (only if tile was placed this turn) - client-side only
-                      if (targetTile === null) {
-                        const newPlaced = placedTiles.map(t => t.row === fromRow && t.col === fromCol ? { ...t, row, col } : t);
-                        setPlacedTiles(newPlaced as any);
-                        // Update typedSequence
-                        setTypedSequence(prev => prev.map(t => t.row === fromRow && t.col === fromCol ? { ...t, row, col } : t));
-                        return;
-                      }
-
-                      // target occupied -> check if target tile was also placed this turn (can swap)
-                      const targetPlaced = placedTiles.find(t => t.row === row && t.col === col);
-                      if (!targetPlaced) {
-                        // Target has an old tile from previous turns - cannot swap with it
-                        return;
-                      }
-
-                      // Both tiles were placed this turn -> swap both on field (client-side only)
-
-                      // update placedTiles: adjust positions and preserve blank flags
-                      setPlacedTiles(prev => {
-                        const next = prev.map(t => {
-                          if (t.row === fromRow && t.col === fromCol) return { ...t, row: row, col: col };
-                          if (t.row === row && t.col === col) return { ...t, row: fromRow, col: fromCol };
-                          return t;
-                        });
-                        return next as any;
-                      });
-
-                      // Update typedSequence
-                      setTypedSequence(prev => {
-                        return prev.map(t => {
-                          if (t.row === fromRow && t.col === fromCol) return { ...t, row: row, col: col };
-                          if (t.row === row && t.col === col) return { ...t, row: fromRow, col: fromCol };
-                          return t;
-                        });
-                      });
-                      return;
-                    }
-                  } catch (err) {
-                    console.error('[Drop] error', err);
-                  }
-                }}
+                previews={gameState?.previews || EMPTY_PREVIEWS}
+                onSquareClick={stableHandleSquareClick}
+                onTileDrop={stableHandleBoardTileDrop}
               />
+            </div>
               
           </main>
 
-          <aside className="lg:w-80 flex flex-col gap-4">
+          <aside className="lg:w-80 lg:flex-none flex flex-col gap-3 min-w-0 lg:min-h-0 lg:h-full lg:overflow-y-auto pr-1">
             {(//isCurrentPlayer && (
               <>
                 <div className="flex items-center justify-between gap-2">
-                  <GameTimer timeLeft={timeLeft} totalTime={MOVE_TIME} />
+                  <GameTimer
+                    totalTime={MOVE_TIME}
+                    turnStart={timerTurnStart}
+                    paused={!!gameState?.paused}
+                    pausedAt={gameState?.pausedAt ?? null}
+                    gameEnded={!!gameState?.gameEnded}
+                    turnKey={timerTurnKey}
+                    onWarning={handleTimerWarning}
+                    onExpired={handleTimerExpired}
+                  />
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => setIsDark(prev => !prev)}
@@ -1845,6 +1849,7 @@ export default function Game() {
                 )}
 
                 {/* Active placed-word status */}
+                <div className={placedWordStatuses.length > 0 ? '' : 'hidden'}>
                 {placedWordStatuses.length > 0 && (
                   <div className="flex gap-2 mt-2 flex-wrap">
                     {placedWordStatuses.map((p, i) => (
@@ -1868,6 +1873,7 @@ export default function Game() {
                     )}
                   </div>
                 )}
+                </div>
 
                 <WordChecker disabled={!!gameState?.gameEnded} />
 
@@ -1877,11 +1883,11 @@ export default function Game() {
                     rack={displayRackState.length > 0 ? displayRackState : clientRackState || getCurrentPlayer()?.rack || []}
                     selectedTileIndex={selectedTileIndex}
                     selectedIndices={discardMode ? selectedDiscardIndices : undefined}
-                    onTileClick={handleTileClick}
-                    onShuffle={handleShuffle}
-                    onRecall={handleRecall}
-                    onReorder={handleReorderRack}
-                    onDropFromBoard={handleDropFromBoard}
+                    onTileClick={stableHandleTileClick}
+                    onShuffle={stableHandleShuffle}
+                    onRecall={stableHandleRecall}
+                    onReorder={stableHandleReorderRack}
+                    onDropFromBoard={stableHandleDropFromBoard}
                     // Disable interactions when the game has ended
                     canInteract={!isJoining && !gameState?.gameEnded && !gameState?.paused}
                     canShuffle={!isJoining && !gameState?.gameEnded && !gameState?.paused}

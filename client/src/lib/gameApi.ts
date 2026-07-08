@@ -22,8 +22,21 @@ export async function leaveGame(playerId: string): Promise<{ success: boolean; g
   return apiPost<{ success: boolean; gameState?: GameState | null }, { playerId: string }>('/api/game/leave', { playerId }, 'Failed to leave game');
 }
 
-export async function resetSession(requesterId: string): Promise<{ success: boolean; gameState?: GameState | null }> {
-  return apiPost<{ success: boolean; gameState?: GameState | null }, { requesterId: string }>('/api/game/reset-session', { requesterId }, 'Failed to reset session');
+export async function kickPlayer(requesterId: string, targetPlayerId: string): Promise<{ success: boolean; gameState?: GameState | null }> {
+  return apiPost<
+    { success: boolean; gameState?: GameState | null },
+    { requesterId: string; targetPlayerId: string }
+  >('/api/game/kick', { requesterId, targetPlayerId }, 'Failed to remove player');
+}
+
+export async function resetSession(
+  requesterId: string,
+  options?: { preservePlayers?: boolean },
+): Promise<{ success: boolean; gameState?: GameState | null }> {
+  return apiPost<
+    { success: boolean; gameState?: GameState | null },
+    { requesterId: string; preservePlayers?: boolean }
+  >('/api/game/reset-session', { requesterId, preservePlayers: options?.preservePlayers }, 'Failed to reset session');
 }
 
 export type UpdateResponse = { success: boolean; gameState?: GameState };

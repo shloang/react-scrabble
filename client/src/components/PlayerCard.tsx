@@ -1,6 +1,7 @@
+import { memo } from "react";
 import { Player } from "@shared/schema";
 import { Card } from "@/components/ui/card";
-import { Users, Mic, MicOff } from "lucide-react";
+import { Mic, MicOff } from "lucide-react";
 
 interface PlayerCardProps {
   player: Player;
@@ -17,7 +18,7 @@ interface PlayerCardProps {
 
 // Player-specific colors removed — use neutral border for consistency
 
-export default function PlayerCard({ player, isCurrentPlayer, playerIndex, voiceMuted, voiceVolume, voiceLevel, voiceStatus, onToggleMute, onVolumeChange }: PlayerCardProps) {
+function PlayerCard({ player, isCurrentPlayer, playerIndex, voiceMuted, voiceVolume, voiceLevel, voiceStatus, onToggleMute, onVolumeChange }: PlayerCardProps) {
   return (
     <Card
       className={`p-3 border-l-4 border-border transition-all duration-150 ${isCurrentPlayer ? 'ring-1 ring-primary shadow' : 'shadow-sm'} w-1/3 min-h-28 overflow-hidden card-scale`}
@@ -72,3 +73,17 @@ export default function PlayerCard({ player, isCurrentPlayer, playerIndex, voice
     </Card>
   );
 }
+
+export default memo(PlayerCard, (prev, next) => (
+  prev.player.id === next.player.id &&
+  prev.player.name === next.player.name &&
+  prev.player.score === next.player.score &&
+  prev.isCurrentPlayer === next.isCurrentPlayer &&
+  prev.playerIndex === next.playerIndex &&
+  prev.voiceMuted === next.voiceMuted &&
+  prev.voiceVolume === next.voiceVolume &&
+  prev.voiceLevel === next.voiceLevel &&
+  prev.voiceStatus === next.voiceStatus &&
+  prev.onToggleMute === next.onToggleMute &&
+  prev.onVolumeChange === next.onVolumeChange
+));

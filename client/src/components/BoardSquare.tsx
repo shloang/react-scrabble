@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { SquareType } from "@shared/schema";
 import Tile from "./Tile";
 import { useElementSize } from '@/hooks/useElementSize';
@@ -11,6 +12,7 @@ interface BoardSquareProps {
   isBlankPlaced?: boolean;
   isTypingCursor?: 'right' | 'down' | null;
   onClick?: () => void;
+  onSquareClick?: (row: number, col: number) => void;
   onDrop?: (row: number, col: number, data: any) => void;
   highlight?: 'valid' | 'invalid' | 'checking' | null;
   isLastMove?: boolean;
@@ -87,8 +89,9 @@ function BoardTile({
   );
 }
 
-export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isBlankPlaced, isTypingCursor, onClick, onDrop, highlight, isLastMove, preview }: BoardSquareProps) {
+function BoardSquare({ row, col, type, letter, isNewlyPlaced, isBlankPlaced, isTypingCursor, onClick, onSquareClick, onDrop, highlight, isLastMove, preview }: BoardSquareProps) {
   const hasLetter = letter !== null;
+  const handleClick = onClick || (onSquareClick ? () => onSquareClick(row, col) : undefined);
 
   const handleDragOver = (e: any) => {
     e.preventDefault();
@@ -125,7 +128,7 @@ export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isB
 
   return (
     <div
-      onClick={onClick}
+      onClick={handleClick}
       onDragOver={handleDragOver}
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
@@ -133,7 +136,7 @@ export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isB
       className={`
         aspect-square border border-border/30 flex items-center justify-center relative
         ${!hasLetter ? SQUARE_COLORS[type] : 'bg-background'}
-        ${onClick && !hasLetter ? 'cursor-pointer hover:opacity-80' : ''}
+        ${handleClick && !hasLetter ? 'cursor-pointer hover:opacity-80' : ''}
         ${isNewlyPlaced ? 'ring-2 ring-primary ring-inset' : ''}
         ${highlight === 'valid' ? 'ring-4 ring-green-400/60' : ''}
         ${highlight === 'invalid' ? 'ring-4 ring-red-400/60' : ''}
@@ -148,7 +151,7 @@ export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isB
           letter={letter}
           isBlankPlaced={isBlankPlaced}
           isLastMove={isLastMove}
-          onClick={onClick}
+          onClick={handleClick}
         />
       ) : (
         type !== 'NORMAL' && (
@@ -191,3 +194,25 @@ export default function BoardSquare({ row, col, type, letter, isNewlyPlaced, isB
     </div>
   );
 }
+
+function samePreview(a?: BoardSquareProps['preview'], b?: BoardSquareProps['preview']) {
+  if (a === b) return true;
+  if (!a || !b) return a === b;
+  return a.letter === b.letter && !!a.isBlank === !!b.isBlank && a.playerId === b.playerId;
+}
+
+export default memo(BoardSquare, (prev, next) => (
+  prev.row === next.row &&
+  prev.col === next.col &&
+  prev.type === next.type &&
+  prev.letter === next.letter &&
+  prev.isNewlyPlaced === next.isNewlyPlaced &&
+  prev.isBlankPlaced === next.isBlankPlaced &&
+  prev.isTypingCursor === next.isTypingCursor &&
+  prev.highlight === next.highlight &&
+  prev.isLastMove === next.isLastMove &&
+  samePreview(prev.preview, next.preview) &&
+  prev.onClick === next.onClick &&
+  prev.onSquareClick === next.onSquareClick &&
+  prev.onDrop === next.onDrop
+));

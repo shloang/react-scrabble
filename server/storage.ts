@@ -3,18 +3,32 @@ import { createHash } from "crypto";
 import fs from 'fs/promises';
 import path from 'path';
 
+export type StoredPlayerStatsEntry = {
+  wins: number;
+  losses: number;
+  games: number;
+  updatedAt: number;
+  lastGameKey?: string;
+};
+
+export type StoredPlayerStats = Record<string, StoredPlayerStatsEntry>;
+
 export interface IStorage {
   getGameState(): Promise<GameState | undefined>;
   saveGameState(gameState: GameState): Promise<void>;
+  getPlayerStats?(): Promise<StoredPlayerStats>;
+  savePlayerStats?(stats: StoredPlayerStats): Promise<void>;
 }
 
 export class MemStorage implements IStorage {
   private gameState: GameState | undefined;
   private credentials: Record<string, string>; // map playerId -> passwordHash
+  private playerStats: StoredPlayerStats;
 
   constructor() {
     this.gameState = undefined;
     this.credentials = {};
+    this.playerStats = {};
   }
 
   async getGameState(): Promise<GameState | undefined> {
@@ -23,6 +37,14 @@ export class MemStorage implements IStorage {
 
   async saveGameState(gameState: GameState): Promise<void> {
     this.gameState = gameState;
+  }
+
+  async getPlayerStats(): Promise<StoredPlayerStats> {
+    return { ...this.playerStats };
+  }
+
+  async savePlayerStats(stats: StoredPlayerStats): Promise<void> {
+    this.playerStats = { ...stats };
   }
 
   async setPlayerPassword(playerId: string, password: string): Promise<void> {
@@ -44,11 +66,13 @@ export class MemStorage implements IStorage {
 class FileStorage implements IStorage {
   private filePath: string;
   private credPath: string = '';
+  private statsPath: string = '';
   private credentials: Record<string, string>;
 
   constructor(filePath?: string) {
     this.filePath = filePath || (process.env.GAME_STATE_FILE || 'data/game-state.json');
     this.credPath = (process.env.GAME_CRED_FILE || 'data/credentials.json');
+    this.statsPath = (process.env.PLAYER_STATS_FILE || 'data/player-stats.json');
     this.credentials = {};
     // ensure directory exists
     try {
@@ -89,6 +113,29 @@ class FileStorage implements IStorage {
     const tmp = this.filePath + '.tmp';
     await fs.writeFile(tmp, JSON.stringify(gameState), 'utf8');
     await fs.rename(tmp, this.filePath);
+  }
+
+  async getPlayerStats(): Promise<StoredPlayerStats> {
+    try {
+      const s = await fs.readFile(this.statsPath, 'utf8');
+      const parsed = JSON.parse(s) || {};
+      if (!parsed || typeof parsed !== 'object') return {};
+      return parsed as StoredPlayerStats;
+    } catch (e) {
+      return {};
+    }
+  }
+
+  async savePlayerStats(stats: StoredPlayerStats): Promise<void> {
+    try {
+      const dir = path.dirname(this.statsPath);
+      await fs.mkdir(dir, { recursive: true });
+      const tmp = this.statsPath + '.tmp';
+      await fs.writeFile(tmp, JSON.stringify(stats), 'utf8');
+      await fs.rename(tmp, this.statsPath);
+    } catch (e) {
+      // ignore stats persistence errors; game state remains authoritative
+    }
   }
 
   async setPlayerPassword(playerId: string, password: string): Promise<void> {

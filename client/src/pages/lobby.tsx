@@ -6,7 +6,7 @@ import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { getGameState, updateGameState, leaveGame, resetSession as resetSessionApi } from '@/lib/gameApi';
+import { getGameState, updateGameState, leaveGame, kickPlayer, resetSession as resetSessionApi } from '@/lib/gameApi';
 import { useToast } from '@/hooks/use-toast';
 import { getStats } from '@/lib/playerStats';
 import { deriveCacheBadgeState } from '@/lib/statsCacheDisplay';
@@ -510,6 +510,49 @@ export default function Lobby() {
     }
   };
 
+  const handleNewGameFromEnded = async () => {
+    if (!playerId) {
+      toast({ variant: 'destructive', title: 'Session invalid', description: 'Rejoin the lobby and try again.' });
+      return;
+    }
+
+    try {
+      const resp = await resetSessionApi(playerId, { preservePlayers: true });
+      if (resp?.gameState) {
+        queryClient.setQueryData(['/api/game'], resp.gameState);
+      } else {
+        queryClient.invalidateQueries({ queryKey: ['/api/game'] });
+      }
+      setVoiceStarted(false);
+      setVoiceMicMuted(false);
+      setVoicePeerMuted({});
+      setVoicePeerVolumes({});
+      setVoiceReconnectAttempt(0);
+      toast({ title: 'New lobby ready', description: 'Players were kept, readiness and voice settings were reset.' });
+    } catch (err: any) {
+      toast({ variant: 'destructive', title: 'Could not create new lobby', description: err?.message || 'Error' });
+    }
+  };
+
+  const handleKickPlayer = async (targetPlayerId: string) => {
+    if (!playerId || !hasActiveSession || gameInProgress || targetPlayerId === playerId) return;
+    const target = gameState?.players?.find((p: any) => p.id === targetPlayerId);
+    const ok = window.confirm(`Remove ${target?.name || 'player'} from the lobby?`);
+    if (!ok) return;
+
+    try {
+      const resp = await kickPlayer(playerId, targetPlayerId);
+      if (resp?.gameState) {
+        queryClient.setQueryData(['/api/game'], resp.gameState);
+      } else {
+        queryClient.invalidateQueries({ queryKey: ['/api/game'] });
+      }
+      toast({ title: 'Player removed from lobby' });
+    } catch (err: any) {
+      toast({ variant: 'destructive', title: 'Could not remove player', description: err?.message || 'Error' });
+    }
+  };
+
   const handleEnterGame = async () => {
     if (!gameInProgress) {
       toast({ title: 'Игра ещё не начата', description: 'Сначала нажмите «Начать игру»' });
@@ -813,27 +856,13 @@ export default function Lobby() {
     ].join(' | ');
   }
 
-  function PlayerRow({ player, localStats, isLocal, onToggleReady }: any) {
+  function PlayerRow({ player, localStats, isLocal, canKick, onKick }: any) {
     const {
       data: serverStats,
       isLoading: serverStatsLoading,
       isFetching: serverStatsFetching,
       isError: serverStatsError,
     } = useServerStats(player.id);
-
-    const s = serverStats || {
-      wins: 0,
-      losses: 0,
-      games: 0,
-      cachedAt: null,
-      staleAt: null,
-      expiresAt: null,
-      score: player.score,
-      isStale: false,
-      isExpired: false,
-      cacheStatus: 'fresh' as const,
-      ageMs: undefined,
-    };
 
     const badgeState = deriveCacheBadgeState({
       serverStats,
@@ -842,19 +871,19 @@ export default function Lobby() {
       serverStatsError,
     });
 
-    const displayStats = serverStats || {
-      wins: Number(localStats?.wins) || 0,
-      losses: Number(localStats?.losses) || 0,
-      games: Number(localStats?.games) || 0,
-      score: player.score,
-      cachedAt: null,
-      staleAt: null,
-      expiresAt: null,
-      cacheStatus: 'fresh' as const,
-      source: 'local-fallback',
-      isStale: false,
-      isExpired: false,
-      ageMs: undefined,
+    const displayStats = {
+      wins: Number(serverStats?.wins ?? localStats?.wins) || 0,
+      losses: Number(serverStats?.losses ?? localStats?.losses) || 0,
+      games: Number(serverStats?.games ?? localStats?.games) || 0,
+      score: serverStats?.score ?? player.score,
+      cachedAt: serverStats?.cachedAt ?? null,
+      staleAt: serverStats?.staleAt ?? null,
+      expiresAt: serverStats?.expiresAt ?? null,
+      cacheStatus: serverStats?.cacheStatus ?? ('fresh' as const),
+      source: serverStats?.source ?? 'local-fallback',
+      isStale: serverStats?.isStale ?? false,
+      isExpired: serverStats?.isExpired ?? false,
+      ageMs: serverStats?.ageMs,
     };
 
     const cacheMetaTooltip = buildCacheMetaTooltip(serverStats, badgeState.label);
@@ -892,26 +921,26 @@ export default function Lobby() {
     ]);
 
     return (
-      <div className="flex flex-col gap-3 rounded-xl border bg-background/90 p-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex min-w-0 items-center gap-3">
-          <PlayerAvatar player={player} />
+      <div className="flex flex-col gap-2 rounded-lg border bg-background/90 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <PlayerAvatar player={player} className="h-9 w-9 text-xs ring-1 ring-black/10 dark:ring-white/15 shadow-sm" />
           <div className="min-w-0">
-            <div className="font-medium truncate">{player.name}</div>
+            <div className="truncate text-sm font-semibold leading-tight">{player.name}</div>
               <div className="text-xs text-muted-foreground">
-                Очки в партии: {formatStatsNumber(player.score)} • Снимок сервера: {formatStatsNumber(s.score)}
+                Очки: {formatStatsNumber(player.score)} • П {formatStatsNumber(displayStats.wins)} • Пор {formatStatsNumber(displayStats.losses)} • Игр {formatStatsNumber(displayStats.games)}
               </div>
             </div>
           <div
-            className={`ml-auto shrink-0 rounded-full px-2.5 py-1 text-xs font-medium sm:ml-0 ${player.ready ? 'bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100' : 'bg-amber-100 text-amber-800 dark:bg-amber-800 dark:text-amber-100'}`}
+            className={`ml-auto shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium sm:ml-0 ${player.ready ? 'bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100' : 'bg-amber-100 text-amber-800 dark:bg-amber-800 dark:text-amber-100'}`}
           >
             {player.ready ? 'Готов' : 'Не готов'}
           </div>
         </div>
-        <div className="flex w-full flex-col gap-2 sm:w-auto sm:items-end">
+        <div className="flex w-full flex-col gap-1 sm:w-auto sm:items-end">
           <div className="flex flex-wrap items-center gap-2 sm:justify-end">
             <Badge
               variant={badgeState.variant}
-              className="inline-flex items-center gap-1"
+              className="inline-flex h-6 items-center gap-1 px-2 text-[11px]"
               aria-live="polite"
               title={cacheMetaTooltip}
               aria-label={cacheMetaTooltip}
@@ -919,7 +948,7 @@ export default function Lobby() {
               {(serverStatsLoading || serverStatsFetching) && !serverStatsError ? <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" /> : null}
               <span>{badgeState.label}</span>
             </Badge>
-            {Number.isFinite(s.cachedAt) && (
+            {false && Number.isFinite(serverStats?.cachedAt) && (
               <span
                 className="text-[11px] text-muted-foreground"
                 title={`Возраст серверного снимка: ${formatStatsAge(serverStats)}. ${cacheMetaTooltip}`}
@@ -928,17 +957,17 @@ export default function Lobby() {
               </span>
             )}
           </div>
-          <div className="grid gap-1 text-xs text-muted-foreground sm:text-right">
+          <div className="hidden gap-1 text-xs text-muted-foreground sm:text-right">
             <div>
               Локально: победы {formatStatsNumber(localStats?.wins)}, поражения {formatStatsNumber(localStats?.losses)}, игр {formatStatsNumber(localStats?.games)}
             </div>
             <div className={serverStatsError ? 'text-destructive' : ''}>
-              Сервер: победы {formatStatsNumber(displayStats.wins)}, поражения {formatStatsNumber(displayStats.losses)}, игр {formatStatsNumber(displayStats.games)}
-              {serverStatsError ? ' (ошибка загрузки)' : ''}
+              Итоги: победы {formatStatsNumber(displayStats.wins)}, поражения {formatStatsNumber(displayStats.losses)}, игр {formatStatsNumber(displayStats.games)}
+              {serverStatsError ? ' (серверный снимок недоступен)' : ''}
             </div>
-            {Number.isFinite(s.cachedAt) || Number.isFinite(s.staleAt) || Number.isFinite(s.expiresAt) ? (
+            {Number.isFinite(serverStats?.cachedAt) || Number.isFinite(serverStats?.staleAt) || Number.isFinite(serverStats?.expiresAt) ? (
               <div className="text-[11px]" title={cacheMetaTooltip}>
-                Обновлено: {formatStatsTime(s.cachedAt)} • Устареет: {formatStatsTime(s.staleAt)} • Истечет: {formatStatsTime(s.expiresAt)}
+                Обновлено: {formatStatsTime(serverStats?.cachedAt)} • Устареет: {formatStatsTime(serverStats?.staleAt)} • Истечет: {formatStatsTime(serverStats?.expiresAt)}
               </div>
             ) : (
               <div className="text-[11px]" title={cacheMetaTooltip}>
@@ -946,9 +975,14 @@ export default function Lobby() {
               </div>
             )}
           </div>
+          {canKick && (
+            <div className="flex flex-wrap gap-2">
+              <Button size="sm" variant="destructive" onClick={onKick} className="h-7 px-2 text-xs">Remove</Button>
+            </div>
+          )}
           {isLocal && (
             <div className="flex flex-wrap gap-2">
-              <Button size="sm" variant="outline" onClick={() => setAvatarDialogOpen(true)}>Аватар</Button>
+              <Button size="sm" variant="outline" onClick={() => setAvatarDialogOpen(true)} className="h-7 px-2 text-xs">Аватар</Button>
             </div>
           )}
         </div>
@@ -979,6 +1013,12 @@ export default function Lobby() {
             {sessionStatusLabel}
           </div>
         </div>
+        {gameEnded && activeSessionPlayer && (
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm">
+            <div className="text-amber-700 dark:text-amber-300">Game is finished. Create a fresh lobby to start another round.</div>
+            <Button size="sm" variant="secondary" onClick={handleNewGameFromEnded}>New game</Button>
+          </div>
+        )}
         <div className="mb-4 rounded border p-3 bg-background/80">
           <div className="flex flex-wrap items-center gap-2 justify-between">
             <div className="flex items-center gap-2">
@@ -1198,7 +1238,16 @@ export default function Lobby() {
           {(gameState?.players || []).map((p: any) => {
             const local = getStats(p.id);
             const isLocal = p.id === localStorage.getItem('playerId');
-            return <PlayerRow key={p.id} player={p} localStats={local} isLocal={isLocal} onToggleReady={() => handleToggleReady(p.id)} />;
+            return (
+              <PlayerRow
+                key={p.id}
+                player={p}
+                localStats={local}
+                isLocal={isLocal}
+                canKick={hasActiveSession && !isLocal && !gameInProgress}
+                onKick={() => handleKickPlayer(p.id)}
+              />
+            );
           })}
         </div>
         <div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
@@ -1212,7 +1261,7 @@ export default function Lobby() {
           {canResetSession && (
             <Button variant="destructive" onClick={handleResetSession}>Сбросить сессию</Button>
           )}
-          {!gameInProgress && isHost && (
+          {!gameInProgress && !gameEnded && isHost && (
             <Button variant="secondary" onClick={handleStart} disabled={isStarting || !allReady}>{isStarting ? 'Запуск...' : 'Начать игру'}</Button>
           )}
         </div>

@@ -65,11 +65,11 @@ export default function EndGameScreen({ gameState, currentPlayerId, onNewGame, o
   }, [onClose]);
   return (
     <div
-      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+      className="fixed inset-0 bg-black/50 flex items-start justify-center z-50 p-3 sm:p-4 overflow-hidden"
       onClick={() => { if (onClose) onClose(); }}
     >
-      <Card className="max-w-2xl w-full p-8 space-y-6" onClick={(e) => e.stopPropagation()}>
-        <div className="absolute right-4 top-4 flex gap-2">
+      <Card className="relative max-w-4xl w-full max-h-[calc(100dvh-1.5rem)] sm:max-h-[calc(100dvh-2rem)] overflow-y-auto p-4 sm:p-6 lg:p-8 space-y-4 sm:space-y-6" onClick={(e) => e.stopPropagation()}>
+        <div className="sticky top-0 z-10 -mt-2 -mr-2 flex justify-end gap-2">
           {onMinimize && (
             <button
               aria-label="Minimize"
@@ -92,20 +92,20 @@ export default function EndGameScreen({ gameState, currentPlayerId, onNewGame, o
           )}
         </div>
         <div className="text-center">
-          <div className={`text-6xl mb-4 ${isWinner ? 'text-yellow-500' : 'text-gray-400'}`}>
+          <div className={`text-5xl sm:text-6xl mb-3 sm:mb-4 ${isWinner ? 'text-yellow-500' : 'text-gray-400'}`}>
             {isWinner ? '🏆' : '😔'}
           </div>
-          <h1 className="text-4xl font-bold mb-2">
+          <h1 className="text-2xl sm:text-4xl font-bold mb-2">
             {isWinner ? 'Поздравляем! Вы выиграли!' : 'Игра окончена'}
           </h1>
           {winner && (
-            <p className="text-2xl text-muted-foreground">
+            <p className="text-lg sm:text-2xl text-muted-foreground">
               Победитель: <span className="font-bold text-primary">{winner.name}</span> ({winner.score} очков)
             </p>
           )}
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-4">
           <Card className="p-4">
             <div className="flex items-center gap-2 mb-2">
               <Trophy className="w-5 h-5 text-yellow-500" />
@@ -189,7 +189,7 @@ export default function EndGameScreen({ gameState, currentPlayerId, onNewGame, o
         </div>
 
         {onNewGame && (
-          <div className="text-center pt-4">
+          <div className="sticky bottom-0 -mb-2 bg-card/95 backdrop-blur text-center pt-3 pb-2">
             <button
               onClick={onNewGame}
               className="px-6 py-3 bg-primary text-primary-foreground rounded-lg font-semibold hover:bg-primary/90 transition-colors"

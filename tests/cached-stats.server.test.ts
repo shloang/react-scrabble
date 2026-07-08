@@ -10,6 +10,7 @@ type StorageLike = {
   getGameState: () => Promise<GameState | undefined>;
   saveGameState: (gameState: GameState) => Promise<void>;
   setPlayerPassword?: (playerId: string, password: string) => Promise<void>;
+  savePlayerStats?: (stats: Record<string, { wins: number; losses: number; games: number; updatedAt: number; lastGameKey?: string }>) => Promise<void>;
 };
 
 let baseUrl = '';
@@ -69,6 +70,22 @@ async function getStats(path: string) {
   return { status: resp.status, body };
 }
 
+async function postJson(path: string, body: unknown) {
+  const resp = await fetch(`${baseUrl}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await resp.json();
+  return { status: resp.status, body: data };
+}
+
+async function getText(path: string) {
+  const resp = await fetch(`${baseUrl}${path}`);
+  const text = await resp.text();
+  return { status: resp.status, text, contentType: resp.headers.get('content-type') || '' };
+}
+
 before(async () => {
   process.env.USE_FILE_STORAGE = 'false';
 
@@ -105,6 +122,7 @@ after(async () => {
 beforeEach(async () => {
   resetDateNow();
   await storage.saveGameState(makeState({ revision: 10 }));
+  if (storage.savePlayerStats) await storage.savePlayerStats({});
 });
 
 test('returns fresh stats and reuses cached entry on immediate follow-up', async () => {
@@ -145,6 +163,146 @@ test('marks stats as stale once staleAt threshold is crossed without expiration'
   assert.equal(second.body.isStale, true);
   assert.equal(second.body.isExpired, false);
   assert.equal(second.body.cachedAt, first.body.cachedAt);
+});
+
+test('keeps lifetime stats when cache metadata expires', async () => {
+  if (storage.savePlayerStats) {
+    await storage.savePlayerStats({
+      p1: { wins: 3, losses: 2, games: 5, updatedAt: 1_699_999_000_000 },
+    });
+  }
+
+  setFakeNow(1_700_000_100_000);
+  const first = await getStats('/api/player-stats/p1');
+  assert.equal(first.status, 200);
+  assert.equal(first.body.wins, 3);
+  assert.equal(first.body.losses, 2);
+  assert.equal(first.body.games, 5);
+
+  setFakeNow(Number(first.body.expiresAt) + 1);
+  const second = await getStats('/api/player-stats/p1');
+  assert.equal(second.status, 200);
+  assert.equal(second.body.cacheStatus, 'fresh');
+  assert.equal(second.body.wins, 3);
+  assert.equal(second.body.losses, 2);
+  assert.equal(second.body.games, 5);
+});
+
+test('records ended game stats once and reuses them after reset', async () => {
+  const endedState = makeState({
+    revision: 19,
+    started: true,
+    players: [
+      makePlayer('p1', 'Alice', 50),
+      makePlayer('p2', 'Bob', 20),
+    ],
+  });
+  endedState.gameEnded = true;
+  endedState.winnerId = 'p1';
+  endedState.endReason = 'test-ended';
+  endedState.sessionCreatedAt = 1_700_001_000_000;
+  endedState.moves = [{ playerId: 'p1', playerName: 'Alice', words: ['TEST'], score: 50, turn: 1, timestamp: 1_700_001_010_000, type: 'play' }];
+  await storage.saveGameState(endedState);
+
+  setFakeNow(1_700_001_020_000);
+  const winnerStats = await getStats('/api/player-stats/p1');
+  assert.equal(winnerStats.status, 200);
+  assert.equal(winnerStats.body.wins, 1);
+  assert.equal(winnerStats.body.losses, 0);
+  assert.equal(winnerStats.body.games, 1);
+
+  const reset = await postJson('/api/game/reset-session', { requesterId: 'p2', preservePlayers: true });
+  assert.equal(reset.status, 200);
+
+  const afterReset = await getStats('/api/player-stats/p1');
+  assert.equal(afterReset.status, 200);
+  assert.equal(afterReset.body.wins, 1);
+  assert.equal(afterReset.body.losses, 0);
+  assert.equal(afterReset.body.games, 1);
+
+  const loserStats = await getStats('/api/player-stats/p2');
+  assert.equal(loserStats.status, 200);
+  assert.equal(loserStats.body.wins, 0);
+  assert.equal(loserStats.body.losses, 1);
+  assert.equal(loserStats.body.games, 1);
+});
+
+test('reuses lifetime stats when the same player rejoins with a new id', async () => {
+  if (storage.savePlayerStats) {
+    await storage.savePlayerStats({
+      oldAliceId: { wins: 2, losses: 1, games: 3, updatedAt: 1_700_001_000_000 },
+    });
+  }
+  await storage.saveGameState(makeState({
+    revision: 21,
+    players: [
+      makePlayer('oldAliceId', 'Alice', 0),
+      makePlayer('p2', 'Bob', 0),
+    ],
+  }));
+
+  const migrated = await getStats('/api/player-stats/oldAliceId');
+  assert.equal(migrated.status, 200);
+  assert.equal(migrated.body.wins, 2);
+  assert.equal(migrated.body.losses, 1);
+  assert.equal(migrated.body.games, 3);
+
+  await storage.saveGameState(makeState({
+    revision: 22,
+    players: [
+      makePlayer('newAliceId', 'Alice', 0),
+      makePlayer('p2', 'Bob', 0),
+    ],
+  }));
+
+  const rejoined = await getStats('/api/player-stats/newAliceId');
+  assert.equal(rejoined.status, 200);
+  assert.equal(rejoined.body.wins, 2);
+  assert.equal(rejoined.body.losses, 1);
+  assert.equal(rejoined.body.games, 3);
+});
+
+test('participant can remove stale players from a non-active lobby', async () => {
+  await storage.saveGameState(makeState({
+    revision: 23,
+    players: [
+      makePlayer('host', 'Host', 0),
+      makePlayer('stale', 'Stale', 0),
+      makePlayer('ready', 'Ready', 0),
+    ],
+  }));
+
+  const removed = await postJson('/api/game/kick', { requesterId: 'ready', targetPlayerId: 'stale' });
+  assert.equal(removed.status, 200);
+  assert.deepEqual(
+    removed.body.gameState.players.map((p: Player) => p.id),
+    ['host', 'ready'],
+  );
+});
+
+test('outsiders and active games cannot remove lobby players', async () => {
+  await storage.saveGameState(makeState({
+    revision: 24,
+    players: [
+      makePlayer('host', 'Host', 0),
+      makePlayer('guest', 'Guest', 0),
+    ],
+  }));
+
+  const denied = await postJson('/api/game/kick', { requesterId: 'outsider', targetPlayerId: 'host' });
+  assert.equal(denied.status, 403);
+
+  await storage.saveGameState(makeState({
+    revision: 25,
+    started: true,
+    players: [
+      makePlayer('host', 'Host', 0),
+      makePlayer('guest', 'Guest', 0),
+    ],
+  }));
+
+  const active = await postJson('/api/game/kick', { requesterId: 'host', targetPlayerId: 'guest' });
+  assert.equal(active.status, 409);
 });
 
 test('rebuilds cache when score or state revision drifts', async () => {
@@ -257,4 +415,104 @@ test('returns 401 for invalid requester password', async () => {
 
   assert.equal(out.status, 401);
   assert.match(String(out.body.error || ''), /invalid requester credentials/i);
+});
+
+test('ended-game reset preserves player identities and returns them to a fresh lobby', async () => {
+  const endedState = makeState({
+    revision: 20,
+    started: true,
+    players: [
+      {
+        ...makePlayer('p1', 'Alice', 99),
+        rack: ['А', null, null, null, null, null, null],
+        ready: true,
+        voiceEnabled: true,
+        originalScore: 120,
+        tilePenalty: 21,
+      },
+      {
+        ...makePlayer('p2', 'Bob', 70),
+        rack: ['Б', null, null, null, null, null, null],
+        ready: true,
+        voiceEnabled: true,
+        originalScore: 80,
+        tilePenalty: 10,
+      },
+    ],
+  });
+  endedState.gameEnded = true;
+  endedState.winnerId = 'p1';
+  endedState.endReason = 'test-ended';
+
+  await storage.saveGameState(endedState);
+
+  const reset = await postJson('/api/game/reset-session', { requesterId: 'p2', preservePlayers: true });
+
+  assert.equal(reset.status, 200);
+  assert.equal(reset.body.success, true);
+  assert.equal(reset.body.gameState.gameEnded, false);
+  assert.equal(reset.body.gameState.currentPlayer, null);
+  assert.equal(reset.body.gameState.turn, 0);
+  assert.deepEqual(reset.body.gameState.moves, []);
+  assert.deepEqual(reset.body.gameState.players.map((p: Player) => p.id), ['p1', 'p2']);
+
+  const alice = reset.body.gameState.players.find((p: Player) => p.id === 'p1');
+  const bob = reset.body.gameState.players.find((p: Player) => p.id === 'p2');
+  assert.equal(alice.name, 'Alice');
+  assert.equal(bob.name, 'Bob');
+  assert.equal(alice.score, 0);
+  assert.equal(bob.score, 0);
+  assert.equal(alice.ready, false);
+  assert.equal(bob.ready, false);
+  assert.equal(alice.voiceEnabled, false);
+  assert.equal(bob.voiceEnabled, false);
+  assert.equal(alice.originalScore, undefined);
+  assert.equal(alice.tilePenalty, undefined);
+  assert.equal(alice.rack.length, 7);
+  assert.equal(bob.rack.length, 7);
+
+  const validate = await fetch(`${baseUrl}/api/player/p2`);
+  assert.equal(validate.status, 200);
+  const validatedPlayer = await validate.json();
+  assert.equal(validatedPlayer.id, 'p2');
+});
+
+test('ended-game lobby return is idempotent for host after players are preserved', async () => {
+  const endedState = makeState({
+    revision: 21,
+    started: true,
+    players: [
+      { ...makePlayer('p1', 'Alice', 44), ready: true, voiceEnabled: true },
+      { ...makePlayer('p2', 'Bob', 33), ready: true, voiceEnabled: true },
+    ],
+  });
+  endedState.gameEnded = true;
+  endedState.winnerId = 'p1';
+  endedState.endReason = 'test-ended';
+
+  await storage.saveGameState(endedState);
+
+  const firstReset = await postJson('/api/game/reset-session', { requesterId: 'p2', preservePlayers: true });
+  assert.equal(firstReset.status, 200);
+  assert.deepEqual(firstReset.body.gameState.players.map((p: Player) => p.id), ['p1', 'p2']);
+  assert.equal(firstReset.body.gameState.gameEnded, false);
+
+  const hostReturn = await postJson('/api/game/reset-session', { requesterId: 'p1', preservePlayers: true });
+  assert.equal(hostReturn.status, 200);
+  assert.deepEqual(hostReturn.body.gameState.players.map((p: Player) => p.id), ['p1', 'p2']);
+  assert.equal(hostReturn.body.gameState.gameEnded, false);
+  assert.equal(hostReturn.body.gameState.currentPlayer, null);
+
+  const validateHost = await fetch(`${baseUrl}/api/player/p1`);
+  const validateGuest = await fetch(`${baseUrl}/api/player/p2`);
+  assert.equal(validateHost.status, 200);
+  assert.equal(validateGuest.status, 200);
+});
+
+test('serves local word list without CommonJS __dirname', async () => {
+  const out = await getText('/api/wordlist');
+
+  assert.equal(out.status, 200);
+  assert.match(out.contentType, /text\/plain/);
+  assert.ok(out.text.length > 1000);
 });

@@ -3,7 +3,7 @@ import net from 'net';
 import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import { createServer, type Server } from "http";
 import { WebSocketServer, WebSocket } from 'ws';
-import { storage } from "./storage";
+import { storage, type StoredPlayerStats, type StoredPlayerStatsEntry } from "./storage";
 import { BOARD_SIZE, TILE_DISTRIBUTION, MOVE_TIME, type GameState, type Player, gameStateSchema } from "@shared/schema";
 import { extractWordsFromBoard, calculateScore, checkGameEnd } from "./gameLogic";
 import { loadWordDictionary, isWordValid } from "./wordDictionary";
@@ -86,6 +86,93 @@ export async function registerRoutes(app: Express): Promise<Server> {
     ),
   );
   const SESSION_STALE_MS = 24 * 60 * 60 * 1000;
+
+  function sanitizeStoredStatsEntry(entry?: Partial<StoredPlayerStatsEntry> | null): StoredPlayerStatsEntry {
+    return {
+      wins: Math.max(0, Math.floor(Number(entry?.wins) || 0)),
+      losses: Math.max(0, Math.floor(Number(entry?.losses) || 0)),
+      games: Math.max(0, Math.floor(Number(entry?.games) || 0)),
+      updatedAt: Number.isFinite(entry?.updatedAt) ? Number(entry?.updatedAt) : 0,
+      lastGameKey: typeof entry?.lastGameKey === 'string' ? entry.lastGameKey : undefined,
+    };
+  }
+
+  function normalizeStatsName(name: string): string {
+    return String(name || '').trim().toLowerCase();
+  }
+
+  function statsNameKey(name: string): string | null {
+    const normalized = normalizeStatsName(name);
+    return normalized ? `name:${normalized}` : null;
+  }
+
+  function pickLatestStatsEntry(...entries: Array<StoredPlayerStatsEntry | undefined>): StoredPlayerStatsEntry {
+    return entries
+      .map((entry) => sanitizeStoredStatsEntry(entry))
+      .sort((a, b) => {
+        if (b.games !== a.games) return b.games - a.games;
+        return b.updatedAt - a.updatedAt;
+      })[0] || sanitizeStoredStatsEntry(null);
+  }
+
+  async function loadStoredPlayerStats(): Promise<StoredPlayerStats> {
+    if (typeof storage.getPlayerStats !== 'function') return {};
+    const raw = await storage.getPlayerStats();
+    const out: StoredPlayerStats = {};
+    for (const [playerId, entry] of Object.entries(raw || {})) {
+      out[playerId] = sanitizeStoredStatsEntry(entry);
+    }
+    return out;
+  }
+
+  async function saveStoredPlayerStats(stats: StoredPlayerStats): Promise<void> {
+    if (typeof storage.savePlayerStats !== 'function') return;
+    await storage.savePlayerStats(stats);
+  }
+
+  function completedGameKey(state: GameState): string {
+    const playerIds = (state.players || []).map((p) => p.id).sort().join(',');
+    const lastMove = Array.isArray(state.moves) && state.moves.length > 0 ? state.moves[state.moves.length - 1] : null;
+    return [
+      Number.isFinite(state.sessionCreatedAt) ? Number(state.sessionCreatedAt) : '',
+      playerIds,
+      state.winnerId || '',
+      state.endReason || '',
+      state.moves?.length || 0,
+      Number.isFinite(lastMove?.timestamp) ? Number(lastMove?.timestamp) : '',
+    ].join('|');
+  }
+
+  async function recordCompletedGameStats(state: GameState): Promise<void> {
+    if (!state?.gameEnded || !state.winnerId || !Array.isArray(state.players) || state.players.length === 0) return;
+    const gameKey = completedGameKey(state);
+    const now = Date.now();
+    const stats = await loadStoredPlayerStats();
+    let changed = false;
+
+    for (const player of state.players) {
+      const nameKey = statsNameKey(player.name);
+      const previous = pickLatestStatsEntry(stats[player.id], nameKey ? stats[nameKey] : undefined);
+      if (previous.lastGameKey === gameKey) continue;
+
+      const next: StoredPlayerStatsEntry = {
+        wins: previous.wins + (player.id === state.winnerId ? 1 : 0),
+        losses: previous.losses + (player.id === state.winnerId ? 0 : 1),
+        games: previous.games + 1,
+        updatedAt: now,
+        lastGameKey: gameKey,
+      };
+      stats[player.id] = next;
+      if (nameKey) stats[nameKey] = next;
+      playerStatsCache.delete(player.id);
+      playerStatsCacheLogSignatures.delete(player.id);
+      changed = true;
+    }
+
+    if (changed) {
+      await saveStoredPlayerStats(stats);
+    }
+  }
 
   function tokenHash(value: string): string {
     return createHash('sha256').update(value).digest('hex');
@@ -359,13 +446,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
     return true;
   }
 
-  function buildStatsCacheEntry(player: Player, revision: number, now: number): CachedStatsEntry {
+  function buildStatsCacheEntry(player: Player, revision: number, now: number, stored?: StoredPlayerStatsEntry): CachedStatsEntry {
+    const totals = sanitizeStoredStatsEntry(stored);
     return {
       playerId: player.id,
       score: Number(player.score) || 0,
-      wins: 0,
-      losses: 0,
-      games: 1,
+      wins: totals.wins,
+      losses: totals.losses,
+      games: totals.games,
       cachedAt: now,
       staleAt: now + PLAYER_STATS_STALE_MS,
       expiresAt: now + PLAYER_STATS_EXPIRE_MS,
@@ -562,6 +650,45 @@ export async function registerRoutes(app: Express): Promise<Server> {
       endReason: undefined,
       previews: {},
     };
+  }
+
+  function createFreshLobbyPreservingPlayers(previous: GameState): GameState {
+    const nextState = createEmptyGameState();
+    const players = Array.isArray(previous.players) ? previous.players : [];
+
+    nextState.players = players.map((player) => {
+      const rack: (string | null)[] = nextState.tileBag.splice(0, 7);
+      while (rack.length < 7) rack.push(null);
+
+      const nextPlayer: Player = {
+        id: player.id,
+        name: player.name,
+        rack,
+        score: 0,
+        ready: false,
+        voiceEnabled: false,
+      };
+
+      if (player.avatarUrl) nextPlayer.avatarUrl = player.avatarUrl;
+      if (player.avatarFallback) nextPlayer.avatarFallback = player.avatarFallback;
+
+      return nextPlayer;
+    });
+
+    nextState.currentPlayer = null;
+    nextState.turn = 0;
+    nextState.moves = [];
+    nextState.gameEnded = false;
+    nextState.winnerId = undefined;
+    nextState.endReason = undefined;
+    nextState.paused = false;
+    nextState.pausedBy = null;
+    nextState.turnStart = null;
+    nextState.pausedAt = null;
+    nextState.previews = {};
+
+    normalizeGameStateAvatars(nextState);
+    return nextState;
   }
 
   // Get current game state
@@ -799,10 +926,62 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   }));
 
-  // Host-only manual session reset: clears all lobby/game presence and starts a fresh session.
+  app.post('/api/game/kick', runLocked(async (req, res) => {
+    try {
+      const requesterId = String(req.body?.requesterId || '').trim();
+      const targetPlayerId = String(req.body?.targetPlayerId || '').trim();
+      if (!requesterId || !targetPlayerId) return res.status(400).json({ error: 'requesterId and targetPlayerId are required' });
+
+      const { state } = await loadActiveStateWithExpiry();
+      normalizeGameStateAvatars(state);
+      if (!state || !Array.isArray(state.players) || state.players.length === 0) {
+        return res.status(404).json({ error: 'No active lobby' });
+      }
+      if (gameInProgress(state)) {
+        return res.status(409).json({ error: 'Cannot remove players while game is in progress' });
+      }
+
+      const requesterIsParticipant = state.players.some((p) => p.id === requesterId);
+      if (!requesterIsParticipant) {
+        return res.status(403).json({ error: 'Only lobby participants can remove players' });
+      }
+      if (targetPlayerId === requesterId) {
+        return res.status(400).json({ error: 'Players cannot remove themselves' });
+      }
+
+      const targetIndex = state.players.findIndex((p) => p.id === targetPlayerId);
+      if (targetIndex === -1) {
+        normalizeGameStateAvatars(state);
+        return res.json({ success: true, gameState: state });
+      }
+
+      revokeVoiceToken(targetPlayerId);
+      state.players.splice(targetIndex, 1);
+      if (state.previews && typeof state.previews === 'object') {
+        delete (state.previews as any)[targetPlayerId];
+      }
+      if (!state.currentPlayer || !state.players.some((p) => p.id === state.currentPlayer)) {
+        state.currentPlayer = null;
+        state.turnStart = null;
+      }
+
+      touchStateActivity(state);
+      bumpRevision(state);
+      await storage.saveGameState(state);
+      normalizeGameStateAvatars(state);
+      return res.json({ success: true, gameState: state });
+    } catch (err) {
+      console.error('[Kick] failed', err);
+      return res.status(500).json({ error: 'Failed to remove player' });
+    }
+  }));
+
+  // Host-only manual session reset. After an ended game, participants return to
+  // a fresh lobby with the same player identities so saved stats/session IDs survive.
   app.post('/api/game/reset-session', runLocked(async (req, res) => {
     try {
       const requesterId = String(req.body?.requesterId || '').trim();
+      const preservePlayers = req.body?.preservePlayers === true;
       if (!requesterId) return res.status(400).json({ error: 'requesterId is required' });
 
       const { state } = await loadActiveStateWithExpiry();
@@ -810,9 +989,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const hostId = state.players[0]?.id;
         const isParticipant = state.players.some((p) => p.id === requesterId);
         const canParticipantResetEndedGame = !!state.gameEnded && isParticipant;
-        if ((!hostId || hostId !== requesterId) && !canParticipantResetEndedGame) {
+        const isAlreadyFreshLobbyForParticipant = isParticipant && !gameInProgress(state) && !state.gameEnded;
+        if (preservePlayers && isAlreadyFreshLobbyForParticipant) {
+          normalizeGameStateAvatars(state);
+          return res.json({ success: true, gameState: state });
+        }
+        if ((!hostId || hostId !== requesterId) && !(preservePlayers && canParticipantResetEndedGame)) {
           return res.status(403).json({ error: 'Only lobby host can reset session' });
         }
+
+        if (preservePlayers && canParticipantResetEndedGame) {
+          await recordCompletedGameStats(state);
+          const resetState = touchStateActivity(createFreshLobbyPreservingPlayers(state));
+          bumpRevision(resetState);
+          await storage.saveGameState(resetState);
+          return res.json({ success: true, gameState: resetState });
+        }
+
         for (const p of state.players) revokeVoiceToken(p.id);
       }
 
@@ -944,6 +1137,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // rebuild and shuffle the bag accordingly.
       const incomingState = result.data as GameState;
       normalizeGameStateAvatars(incomingState);
+      if (previous) {
+        const previousPreviews = previous.previews && typeof previous.previews === 'object' ? previous.previews : {};
+        const incomingPreviews = incomingState.previews && typeof incomingState.previews === 'object' ? incomingState.previews : {};
+        incomingState.previews = { ...incomingPreviews, ...previousPreviews };
+        if (newMoves > prevMoves && incoming.moves && incoming.moves.length > 0) {
+          const lastMove = incoming.moves[incoming.moves.length - 1];
+          if (lastMove?.playerId) delete (incomingState.previews as any)[lastMove.playerId];
+        }
+      }
       // Adjust server-authoritative timestamps and pause transitions.
       try {
         if (previous) {
@@ -1142,6 +1344,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         saved.winnerId = endCheck.winnerId;
         saved.endReason = endCheck.reason;
         bumpRevision(saved);
+        await recordCompletedGameStats(saved);
         await storage.saveGameState(saved);
       }
 
@@ -1155,20 +1358,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Validate word with Wiktionary or word file
   // Serve the local word list as plain text (one word per line)
   app.get('/api/wordlist', async (req, res) => {
-    try {
-      const filePath = path.resolve(__dirname, '..', 'attached_assets', 'russian-mnemonic-words.txt');
+    const candidatePaths = [
+      path.join(process.cwd(), 'attached_assets', 'russian-mnemonic-words.txt'),
+      path.join(process.cwd(), 'russian-mnemonic-words.txt'),
+    ];
+
+    for (const filePath of candidatePaths) {
       try {
         const data = await fs.promises.readFile(filePath, 'utf8');
-        res.type('text/plain').send(data);
+        return res.type('text/plain').send(data);
       } catch (err: any) {
-        if (err && err.code === 'ENOENT') return res.status(404).json({ error: 'Word list not found' });
+        if (err && err.code === 'ENOENT') continue;
         console.error('[wordlist] read error', err);
         return res.status(500).json({ error: 'Failed to read word list' });
       }
-    } catch (err) {
-      console.error('[wordlist] unexpected error', err);
-      res.status(500).json({ error: 'Failed to serve word list' });
     }
+
+    return res.status(404).json({ error: 'Word list not found' });
   });
 
   // Return cached-ish player stats (basic server-side snapshot)
@@ -1184,12 +1390,39 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(auth.status).json({ error: auth.error });
       }
 
-      const p = state.players.find(x => x.id === playerId);
-      if (!p) return res.status(404).json({ error: 'Player not found' });
-
       const now = Date.now();
       const revision = stateRevision(state);
+      if (state.gameEnded) {
+        await recordCompletedGameStats(state);
+      }
+      const storedStats = await loadStoredPlayerStats();
+      const p = state.players.find(x => x.id === playerId);
+      if (!p) {
+        const stored = sanitizeStoredStatsEntry(storedStats[playerId]);
+        if (stored.games <= 0) return res.status(404).json({ error: 'Player not found' });
+        const virtualPlayer: Player = {
+          id: playerId,
+          name: playerId,
+          rack: [null, null, null, null, null, null, null],
+          score: 0,
+        };
+        const entry = buildStatsCacheEntry(virtualPlayer, revision, now, stored);
+        const response = buildStatsResponse(entry, now);
+        return res.json(response);
+      }
+
       cleanupPlayerStatsCache(state, now, revision);
+      const nameKey = statsNameKey(p.name);
+      const lifetimeStats = pickLatestStatsEntry(storedStats[p.id], nameKey ? storedStats[nameKey] : undefined);
+      if (nameKey && lifetimeStats.games > 0) {
+        const nameStats = sanitizeStoredStatsEntry(storedStats[nameKey]);
+        const idStats = sanitizeStoredStatsEntry(storedStats[p.id]);
+        if (nameStats.games < lifetimeStats.games || idStats.games < lifetimeStats.games) {
+          storedStats[nameKey] = lifetimeStats;
+          storedStats[p.id] = lifetimeStats;
+          await saveStoredPlayerStats(storedStats);
+        }
+      }
       const cached = playerStatsCache.get(p.id);
 
       const scoreNow = Number(p.score) || 0;
@@ -1199,18 +1432,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
       else if (cached.playerId !== p.id) missReason = 'player-mismatch';
       else if (cached.score !== scoreNow) missReason = 'score-drift';
       else if (cached.stateRevision !== revision) missReason = 'revision-drift';
+      else if (cached.wins !== (sanitizeStoredStatsEntry(lifetimeStats).wins)
+        || cached.losses !== (sanitizeStoredStatsEntry(lifetimeStats).losses)
+        || cached.games !== (sanitizeStoredStatsEntry(lifetimeStats).games)) missReason = 'lifetime-stats-drift';
       else if (now >= cached.expiresAt) missReason = 'expired';
 
+      const totals = sanitizeStoredStatsEntry(lifetimeStats);
       const canUseCached = !!cached
         && hasValidStatsMetadata(cached, now)
         && cached.playerId === p.id
         && cached.score === scoreNow
         && cached.stateRevision === revision
+        && cached.wins === totals.wins
+        && cached.losses === totals.losses
+        && cached.games === totals.games
         && now < cached.expiresAt;
 
       const entry = canUseCached
         ? (cached as CachedStatsEntry)
-        : buildStatsCacheEntry(p, revision, now);
+        : buildStatsCacheEntry(p, revision, now, totals);
 
       if (!canUseCached) {
         playerStatsCache.set(p.id, entry);
@@ -1218,7 +1458,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       let response = buildStatsResponse(entry, now);
       if (!isStatsResponseConsistent(response, now)) {
-        const repaired = buildStatsCacheEntry(p, revision, now);
+        const repaired = buildStatsCacheEntry(p, revision, now, totals);
         playerStatsCache.set(p.id, repaired);
         response = buildStatsResponse(repaired, now);
         logPlayerStatsCacheEvent(p.id, {
