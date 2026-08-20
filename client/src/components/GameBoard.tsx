@@ -5,7 +5,9 @@ import { useElementSize } from "@/hooks/useElementSize";
 
 interface GameBoardProps {
   board: BoardCell[][];
+  committedBoard?: BoardCell[][];
   placedTiles: PlacedTile[];
+  canEditPlacedTiles?: boolean;
   onSquareClick?: (row: number, col: number) => void;
   onTileDrop?: (row: number, col: number, data: any) => void;
   placedWordStatuses?: { word: string; positions: { row: number; col: number }[]; status: 'valid' | 'invalid' | 'checking' }[];
@@ -23,7 +25,7 @@ function getSquareType(row: number, col: number): SquareType {
   return 'NORMAL';
 }
 
-function GameBoard({ board, placedTiles, onSquareClick, onTileDrop, placedWordStatuses, lastMovePositions, typingCursor, previews }: GameBoardProps) {
+function GameBoard({ board, committedBoard, placedTiles, canEditPlacedTiles = true, onSquareClick, onTileDrop, placedWordStatuses, lastMovePositions, typingCursor, previews }: GameBoardProps) {
   const { ref: boardAreaRef, size } = useElementSize<HTMLDivElement>();
   const boardSize = Math.floor(Math.min(size.width || 0, size.height || 0, 900));
   const boardStyle = boardSize > 0
@@ -36,9 +38,9 @@ function GameBoard({ board, placedTiles, onSquareClick, onTileDrop, placedWordSt
       className="w-full h-full min-h-0 flex items-center justify-center"
       data-testid="game-board"
     >
-      <div 
+      <div
         className="grid gap-1 bg-card rounded-lg p-2 shadow-xl border border-card-border box-border"
-        style={{ 
+        style={{
           gridTemplateColumns: `repeat(${BOARD_SIZE}, 1fr)`,
           ...boardStyle,
         }}
@@ -49,6 +51,7 @@ function GameBoard({ board, placedTiles, onSquareClick, onTileDrop, placedWordSt
             const isNewlyPlaced = placedTiles.some(
               t => t.row === rowIndex && t.col === colIndex
             );
+            const isCommitted = !!committedBoard?.[rowIndex]?.[colIndex];
             const isLastMovePlaced = (lastMovePositions || []).some(p => p.row === rowIndex && p.col === colIndex);
             const isBlankPlaced = (placedTiles as any).some(
               (t: any) => t.row === rowIndex && t.col === colIndex && t.blank
@@ -99,6 +102,7 @@ function GameBoard({ board, placedTiles, onSquareClick, onTileDrop, placedWordSt
                 onDrop={onTileDrop}
                 highlight={highlight}
                 isLastMove={isLastMovePlaced}
+                canDragTile={canEditPlacedTiles && isNewlyPlaced && !isCommitted}
                 preview={previewForSquare ? { letter: previewForSquare.tile.letter, isBlank: !!previewForSquare.tile.blank, playerId: previewForSquare.playerId } : null}
               />
             );
@@ -194,7 +198,9 @@ function samePreviews(a?: Record<string, PlacedTile[]>, b?: Record<string, Place
 
 export default memo(GameBoard, (prev, next) => (
   sameBoard(prev.board, next.board) &&
+  ((!prev.committedBoard && !next.committedBoard) || (!!prev.committedBoard && !!next.committedBoard && sameBoard(prev.committedBoard, next.committedBoard))) &&
   samePlacedTiles(prev.placedTiles, next.placedTiles) &&
+  prev.canEditPlacedTiles === next.canEditPlacedTiles &&
   sameWordStatuses(prev.placedWordStatuses, next.placedWordStatuses) &&
   sameTypingCursor(prev.typingCursor, next.typingCursor) &&
   samePositions(prev.lastMovePositions, next.lastMovePositions) &&

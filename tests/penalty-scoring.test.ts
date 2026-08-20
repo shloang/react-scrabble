@@ -1,9 +1,9 @@
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert';
-import { 
+import {
+  calculateScoreBreakdown,
   calculateRemainingTilesCost, 
   checkGameEnd,
-  TILE_VALUES 
 } from '../server/gameLogic.ts';
 import type { GameState, Player } from '../shared/schema.ts';
 
@@ -115,6 +115,71 @@ describe('Penalty-Based Scoring', () => {
     
     const player2 = gameState.players.find(p => p.id === 'player2');
     assert.strictEqual(player2?.score, 45, 'Player 2 final score should be 45 after penalty');
+  });
+
+  test('checkGameEnd returns a draw for tied highest scores after penalties', () => {
+    const gameState = createTestGameState({
+      tileBag: [],
+      players: [
+        {
+          id: 'player1',
+          name: 'Player 1',
+          rack: [null, null, null, null, null, null, null],
+          score: 50,
+        },
+        {
+          id: 'player2',
+          name: 'Player 2',
+          rack: ['А', null, null, null, null, null, null],
+          score: 51,
+        },
+        {
+          id: 'player3',
+          name: 'Player 3',
+          rack: ['Б', null, null, null, null, null, null],
+          score: 40,
+        },
+      ],
+    });
+
+    const result = checkGameEnd(gameState);
+
+    assert.strictEqual(result.ended, true);
+    assert.strictEqual(result.winnerId, undefined);
+    assert.deepStrictEqual(result.drawPlayerIds, ['player1', 'player2']);
+    assert.deepStrictEqual(gameState.players.map(player => player.score), [50, 50, 37]);
+  });
+
+  test('score breakdown keeps individual word scores separate from the 50-point bonus', () => {
+    const board = Array(15).fill(null).map(() => Array(15).fill(null));
+    board[7][7] = { letter: 'А' };
+    board[7][8] = { letter: 'Б' };
+    board[6][8] = { letter: 'О' };
+
+    const placedTiles = [
+      { row: 7, col: 7, letter: 'А' },
+      { row: 7, col: 8, letter: 'Б' },
+      { row: 0, col: 1, letter: 'А' },
+      { row: 0, col: 2, letter: 'А' },
+      { row: 0, col: 3, letter: 'А' },
+      { row: 0, col: 4, letter: 'А' },
+      { row: 0, col: 5, letter: 'А' },
+    ];
+    for (const tile of placedTiles.slice(2)) {
+      board[tile.row][tile.col] = { letter: tile.letter };
+    }
+
+    const breakdown = calculateScoreBreakdown([
+      { word: 'АБ', positions: [{ row: 7, col: 7 }, { row: 7, col: 8 }] },
+      { word: 'ОБ', positions: [{ row: 6, col: 8 }, { row: 7, col: 8 }] },
+    ], board, placedTiles);
+
+    assert.deepStrictEqual(breakdown.wordScores, [
+      { word: 'АБ', score: 8 },
+      { word: 'ОБ', score: 4 },
+    ]);
+    assert.strictEqual(breakdown.bingoBonus, 50);
+    assert.strictEqual(breakdown.totalScore, 62);
   });
 
   test('checkGameEnd with all players skipping twice', () => {

@@ -1,5 +1,5 @@
 import { BOARD_SIZE, SPECIAL_SQUARES, SquareType, PlacedTile, BoardCell, TILE_VALUES } from "@shared/schema";
-import type { GameState, Move } from "@shared/schema";
+import type { GameState, Move, MoveWordScore } from "@shared/schema";
 
 export interface WordInfo {
   word: string;
@@ -83,17 +83,20 @@ export function extractWordsFromBoard(board: BoardCell[][], placedTiles: PlacedT
   return words;
 }
 
-export function calculateScore(
+export interface ScoreBreakdown {
+  wordScores: MoveWordScore[];
+  bingoBonus: number;
+  totalScore: number;
+}
+
+export function calculateWordScores(
   words: WordInfo[],
   board: BoardCell[][],
   placedTiles: PlacedTile[]
-): number {
-  if (words.length === 0) return 0;
-
-  let totalScore = 0;
+): MoveWordScore[] {
   const placedSet = new Set(placedTiles.map(t => `${t.row},${t.col}`));
 
-  for (const { word, positions } of words) {
+  return words.map(({ word, positions }) => {
     let wordScore = 0;
     let wordMultiplier = 1;
 
@@ -103,7 +106,8 @@ export function calculateScore(
       if (!cell) continue;
 
       const letter = cell.letter;
-      const baseValue = cell.blank ? 0 : (TILE_VALUES[letter] ?? 0);
+      const placedTile = placedTiles.find(tile => tile.row === row && tile.col === col);
+      const baseValue = cell.blank || placedTile?.blank ? 0 : (TILE_VALUES[letter] ?? 0);
 
       if (isNewTile) {
         // Check for special squares
@@ -127,15 +131,28 @@ export function calculateScore(
       }
     }
 
-    totalScore += wordScore * wordMultiplier;
-  }
+    return { word, score: wordScore * wordMultiplier };
+  });
+}
 
-  // Bonus for using all 7 tiles
-  if (placedTiles.length === 7) {
-    totalScore += 50;
-  }
+export function calculateScoreBreakdown(
+  words: WordInfo[],
+  board: BoardCell[][],
+  placedTiles: PlacedTile[]
+): ScoreBreakdown {
+  const wordScores = calculateWordScores(words, board, placedTiles);
+  const bingoBonus = placedTiles.length === 7 ? 50 : 0;
+  const totalScore = wordScores.reduce((sum, entry) => sum + entry.score, 0) + bingoBonus;
 
-  return totalScore;
+  return { wordScores, bingoBonus, totalScore };
+}
+
+export function calculateScore(
+  words: WordInfo[],
+  board: BoardCell[][],
+  placedTiles: PlacedTile[]
+): number {
+  return calculateScoreBreakdown(words, board, placedTiles).totalScore;
 }
 
 function getSquareType(row: number, col: number): SquareType {
@@ -233,38 +250,53 @@ export function calculateRemainingTilesCost(rack: (string | null)[]): number {
   return totalCost;
 }
 
+export interface GameEndResult {
+  ended: boolean;
+  reason?: string;
+  winnerId?: string;
+  drawPlayerIds?: string[];
+}
+
+function applyPenaltiesAndResolveResult(gameState: GameState, reason: string): GameEndResult {
+  const playersWithPenalties = gameState.players.map(player => {
+    const tilePenalty = calculateRemainingTilesCost(player.rack);
+    return {
+      player,
+      originalScore: player.score,
+      tilePenalty,
+      finalScore: player.score - tilePenalty,
+    };
+  });
+
+  const highestScore = Math.max(...playersWithPenalties.map(entry => entry.finalScore));
+  const topPlayerIds = playersWithPenalties
+    .filter(entry => entry.finalScore === highestScore)
+    .map(entry => entry.player.id);
+
+  for (const entry of playersWithPenalties) {
+    entry.player.originalScore = entry.originalScore;
+    entry.player.tilePenalty = entry.tilePenalty;
+    entry.player.score = entry.finalScore;
+  }
+
+  if (topPlayerIds.length > 1) {
+    return { ended: true, reason, drawPlayerIds: topPlayerIds };
+  }
+
+  return { ended: true, reason, winnerId: topPlayerIds[0] };
+}
+
 /**
- * Check if the game has ended and calculate penalty-adjusted winner
+ * Check if the game has ended and resolve final scores after rack penalties.
  */
-export function checkGameEnd(gameState: GameState): { ended: boolean; reason?: string; winnerId?: string } {
+export function checkGameEnd(gameState: GameState): GameEndResult {
+  if (gameState.players.length === 0) return { ended: false };
+
   // Check if any player has no tiles and bag is empty
   for (const player of gameState.players) {
     const hasTiles = player.rack.some(t => t !== null);
     if (!hasTiles && gameState.tileBag.length === 0) {
-      // Calculate penalty-adjusted scores
-      const playersWithPenalties = gameState.players.map(p => ({
-        player: p,
-        originalScore: p.score,
-        tilePenalty: calculateRemainingTilesCost(p.rack),
-        finalScore: p.score - calculateRemainingTilesCost(p.rack)
-      }));
-
-      // Find winner (highest penalty-adjusted score)
-      const winner = playersWithPenalties.reduce((prev, curr) =>
-        curr.finalScore > prev.finalScore ? curr : prev
-      );
-
-      // Update all players' scores with penalty-adjusted scores and store breakdown
-      gameState.players.forEach(p => {
-        const penalties = playersWithPenalties.find(pw => pw.player.id === p.id);
-        if (penalties) {
-          p.originalScore = penalties.originalScore;
-          p.tilePenalty = penalties.tilePenalty;
-          p.score = penalties.finalScore;
-        }
-      });
-
-      return { ended: true, reason: 'player_out_of_tiles', winnerId: winner.player.id };
+      return applyPenaltiesAndResolveResult(gameState, 'player_out_of_tiles');
     }
   }
 
@@ -274,30 +306,7 @@ export function checkGameEnd(gameState: GameState): { ended: boolean; reason?: s
     const recentMoves = moves.slice(-gameState.players.length * 2);
     const allSkips = recentMoves.every(m => m.type === 'skip');
     if (allSkips) {
-      // Calculate penalty-adjusted scores
-      const playersWithPenalties = gameState.players.map(p => ({
-        player: p,
-        originalScore: p.score,
-        tilePenalty: calculateRemainingTilesCost(p.rack),
-        finalScore: p.score - calculateRemainingTilesCost(p.rack)
-      }));
-
-      // Find winner (highest penalty-adjusted score)
-      const winner = playersWithPenalties.reduce((prev, curr) =>
-        curr.finalScore > prev.finalScore ? curr : prev
-      );
-
-      // Update all players' scores with penalty-adjusted scores and store breakdown
-      gameState.players.forEach(p => {
-        const penalties = playersWithPenalties.find(pw => pw.player.id === p.id);
-        if (penalties) {
-          p.originalScore = penalties.originalScore;
-          p.tilePenalty = penalties.tilePenalty;
-          p.score = penalties.finalScore;
-        }
-      });
-
-      return { ended: true, reason: 'all_skipped_twice', winnerId: winner.player.id };
+      return applyPenaltiesAndResolveResult(gameState, 'all_skipped_twice');
     }
   }
 

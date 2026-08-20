@@ -5,7 +5,7 @@ import { createServer, type Server } from "http";
 import { WebSocketServer, WebSocket } from 'ws';
 import { storage, type StoredPlayerStats, type StoredPlayerStatsEntry } from "./storage";
 import { BOARD_SIZE, TILE_DISTRIBUTION, MOVE_TIME, type GameState, type Player, gameStateSchema } from "@shared/schema";
-import { extractWordsFromBoard, calculateScore, checkGameEnd } from "./gameLogic";
+import { extractWordsFromBoard, calculateScoreBreakdown, checkGameEnd } from "./gameLogic";
 import { loadWordDictionary, isWordValid } from "./wordDictionary";
 import os from 'os';
 import fs from 'fs';
@@ -25,6 +25,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     score: number;
     wins: number;
     losses: number;
+    draws: number;
     games: number;
     cachedAt: number;
     staleAt: number;
@@ -91,6 +92,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     return {
       wins: Math.max(0, Math.floor(Number(entry?.wins) || 0)),
       losses: Math.max(0, Math.floor(Number(entry?.losses) || 0)),
+      draws: Math.max(0, Math.floor(Number(entry?.draws) || 0)),
       games: Math.max(0, Math.floor(Number(entry?.games) || 0)),
       updatedAt: Number.isFinite(entry?.updatedAt) ? Number(entry?.updatedAt) : 0,
       lastGameKey: typeof entry?.lastGameKey === 'string' ? entry.lastGameKey : undefined,
@@ -133,18 +135,41 @@ export async function registerRoutes(app: Express): Promise<Server> {
   function completedGameKey(state: GameState): string {
     const playerIds = (state.players || []).map((p) => p.id).sort().join(',');
     const lastMove = Array.isArray(state.moves) && state.moves.length > 0 ? state.moves[state.moves.length - 1] : null;
+    const resultIds = completedGameTopPlayerIds(state).slice().sort().join(',');
     return [
       Number.isFinite(state.sessionCreatedAt) ? Number(state.sessionCreatedAt) : '',
       playerIds,
-      state.winnerId || '',
+      resultIds,
       state.endReason || '',
       state.moves?.length || 0,
       Number.isFinite(lastMove?.timestamp) ? Number(lastMove?.timestamp) : '',
     ].join('|');
   }
 
+  function completedGameTopPlayerIds(state: GameState): string[] {
+    const playerIds = new Set((state.players || []).map(player => player.id));
+    const explicitDrawIds = Array.isArray(state.drawPlayerIds)
+      ? Array.from(new Set(state.drawPlayerIds.filter(id => playerIds.has(id))))
+      : [];
+    if (explicitDrawIds.length > 1) return explicitDrawIds;
+
+    const scores = (state.players || []).map(player => Number(player.score));
+    if (scores.length === 0 || scores.some(score => !Number.isFinite(score))) return [];
+    const highestScore = Math.max(...scores);
+    const tiedTopIds = state.players
+      .filter(player => Number(player.score) === highestScore)
+      .map(player => player.id);
+    if (tiedTopIds.length > 1) return tiedTopIds;
+    if (state.winnerId && playerIds.has(state.winnerId)) return [state.winnerId];
+    return [];
+  }
+
   async function recordCompletedGameStats(state: GameState): Promise<void> {
-    if (!state?.gameEnded || !state.winnerId || !Array.isArray(state.players) || state.players.length === 0) return;
+    if (!state?.gameEnded || !Array.isArray(state.players) || state.players.length === 0) return;
+    const topPlayerIds = completedGameTopPlayerIds(state);
+    if (topPlayerIds.length === 0) return;
+    const topPlayerSet = new Set(topPlayerIds);
+    const isDraw = topPlayerIds.length > 1;
     const gameKey = completedGameKey(state);
     const now = Date.now();
     const stats = await loadStoredPlayerStats();
@@ -155,9 +180,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const previous = pickLatestStatsEntry(stats[player.id], nameKey ? stats[nameKey] : undefined);
       if (previous.lastGameKey === gameKey) continue;
 
+      const isTopPlayer = topPlayerSet.has(player.id);
       const next: StoredPlayerStatsEntry = {
-        wins: previous.wins + (player.id === state.winnerId ? 1 : 0),
-        losses: previous.losses + (player.id === state.winnerId ? 0 : 1),
+        wins: previous.wins + (!isDraw && isTopPlayer ? 1 : 0),
+        losses: previous.losses + (isTopPlayer ? 0 : 1),
+        draws: previous.draws + (isDraw && isTopPlayer ? 1 : 0),
         games: previous.games + 1,
         updatedAt: now,
         lastGameKey: gameKey,
@@ -372,6 +399,41 @@ export async function registerRoutes(app: Express): Promise<Server> {
     return !!state.currentPlayer && (state.turn || 0) > 0 && !state.gameEnded;
   }
 
+  function findCommittedBoardChange(previousBoard: GameState['board'], incomingBoard: GameState['board']) {
+    for (let row = 0; row < BOARD_SIZE; row += 1) {
+      for (let col = 0; col < BOARD_SIZE; col += 1) {
+        const previousCell = previousBoard[row]?.[col];
+        if (!previousCell) continue;
+
+        const incomingCell = incomingBoard[row]?.[col];
+        if (!incomingCell) {
+          return { row, col, kind: 'removed' as const, previousCell };
+        }
+
+        if (
+          incomingCell.letter !== previousCell.letter
+          || !!incomingCell.blank !== !!previousCell.blank
+        ) {
+          return { row, col, kind: 'changed' as const, previousCell, incomingCell };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function findBoardAdditions(previousBoard: GameState['board'], incomingBoard: GameState['board']) {
+    const additions: Array<{ row: number; col: number; cell: NonNullable<GameState['board'][number][number]> }> = [];
+    for (let row = 0; row < BOARD_SIZE; row += 1) {
+      for (let col = 0; col < BOARD_SIZE; col += 1) {
+        const previousCell = previousBoard[row]?.[col];
+        const incomingCell = incomingBoard[row]?.[col];
+        if (!previousCell && incomingCell) additions.push({ row, col, cell: incomingCell });
+      }
+    }
+    return additions;
+  }
+
   function headerValue(value: string | string[] | undefined): string {
     if (Array.isArray(value)) return String(value[0] || '').trim();
     return String(value || '').trim();
@@ -432,7 +494,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   function hasValidStatsMetadata(entry: CachedStatsEntry, now: number): boolean {
     if (!entry || typeof entry !== 'object') return false;
     if (!Number.isFinite(entry.cachedAt) || !Number.isFinite(entry.staleAt) || !Number.isFinite(entry.expiresAt)) return false;
-    if (!Number.isFinite(entry.wins) || !Number.isFinite(entry.losses) || !Number.isFinite(entry.games) || !Number.isFinite(entry.score)) return false;
+    if (!Number.isFinite(entry.wins) || !Number.isFinite(entry.losses) || !Number.isFinite(entry.draws) || !Number.isFinite(entry.games) || !Number.isFinite(entry.score)) return false;
     if (!Number.isFinite(entry.stateRevision)) return false;
     if (entry.cachedAt > now + FUTURE_SKEW_MS) return false;
     if (entry.staleAt < entry.cachedAt) return false;
@@ -453,6 +515,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       score: Number(player.score) || 0,
       wins: totals.wins,
       losses: totals.losses,
+      draws: totals.draws,
       games: totals.games,
       cachedAt: now,
       staleAt: now + PLAYER_STATS_STALE_MS,
@@ -472,6 +535,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       score: entry.score,
       wins: entry.wins,
       losses: entry.losses,
+      draws: entry.draws,
       games: entry.games,
       cachedAt: entry.cachedAt,
       staleAt: entry.staleAt,
@@ -647,6 +711,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       lastActivityAt: now,
       gameEnded: false,
       winnerId: undefined,
+      drawPlayerIds: undefined,
       endReason: undefined,
       previews: {},
     };
@@ -680,6 +745,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     nextState.moves = [];
     nextState.gameEnded = false;
     nextState.winnerId = undefined;
+    nextState.drawPlayerIds = undefined;
     nextState.endReason = undefined;
     nextState.paused = false;
     nextState.pausedBy = null;
@@ -1039,6 +1105,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: 'Game has already ended' });
       }
       const incoming = result.data as GameState;
+      const prevMoves = previous?.moves?.length || 0;
+      const newMoves = incoming.moves?.length || 0;
 
       if (previous) {
         const incomingRevision = typeof incoming.revision === 'number' ? incoming.revision : -1;
@@ -1075,11 +1143,74 @@ export async function registerRoutes(app: Express): Promise<Server> {
         if (previousPlayerIds !== incomingPlayerIds) {
           return res.status(400).json({ error: 'Player roster changes must use join/leave endpoints.' });
         }
+
+        const committedBoardChange = findCommittedBoardChange(previous.board, incoming.board);
+        if (committedBoardChange) {
+          console.warn('[BoardProtection] rejected committed board mutation', {
+            row: committedBoardChange.row,
+            col: committedBoardChange.col,
+            kind: committedBoardChange.kind,
+          });
+          return res.status(400).json({
+            error: 'Committed board tiles cannot be removed or changed.',
+            row: committedBoardChange.row,
+            col: committedBoardChange.col,
+          });
+        }
+
+        const moveDelta = newMoves - prevMoves;
+        const boardAdditions = findBoardAdditions(previous.board, incoming.board);
+        if (moveDelta < 0 || moveDelta > 1) {
+          return res.status(400).json({ error: 'Exactly one move may be appended per turn update.' });
+        }
+
+        if (moveDelta === 0) {
+          if (incoming.turn !== previous.turn || incoming.currentPlayer !== previous.currentPlayer) {
+            return res.status(409).json({ error: 'Turn changes require exactly one new move.' });
+          }
+          if (boardAdditions.length > 0) {
+            return res.status(400).json({ error: 'Board tiles may only be added by a play move.' });
+          }
+        } else {
+          const lastMove = incoming.moves?.[newMoves - 1];
+          if (!lastMove || lastMove.playerId !== previous.currentPlayer) {
+            return res.status(409).json({ error: 'Move player no longer owns the current turn.' });
+          }
+
+          const currentIndex = previous.players.findIndex(player => player.id === previous.currentPlayer);
+          const expectedNextPlayerId = currentIndex >= 0 && previous.players.length > 0
+            ? previous.players[(currentIndex + 1) % previous.players.length]?.id ?? null
+            : null;
+          if (
+            incoming.turn !== previous.turn + 1
+            || lastMove.turn !== incoming.turn
+            || incoming.currentPlayer !== expectedNextPlayerId
+          ) {
+            return res.status(409).json({ error: 'Move does not match the current turn transition.' });
+          }
+
+          const moveType = lastMove.type ?? 'play';
+          if (moveType === 'skip' || moveType === 'exchange') {
+            if (boardAdditions.length > 0) {
+              return res.status(400).json({ error: 'Skip and exchange moves cannot place board tiles.' });
+            }
+          } else if (boardAdditions.length === 0) {
+            return res.status(400).json({ error: 'Play move must add at least one board tile.' });
+          }
+        }
       }
 
       // If there are more moves in the incoming state, inspect the last move
-      const prevMoves = previous?.moves?.length || 0;
-      const newMoves = incoming.moves?.length || 0;
+      // Score breakdowns already accepted by the server are immutable. The
+      // client still posts a full snapshot, so copy these fields from storage
+      // before handling a newly appended move.
+      if (previous?.moves && incoming.moves) {
+        const sharedMoveCount = Math.min(prevMoves, newMoves);
+        for (let index = 0; index < sharedMoveCount; index++) {
+          incoming.moves[index].wordScores = previous.moves[index].wordScores;
+          incoming.moves[index].bingoBonus = previous.moves[index].bingoBonus;
+        }
+      }
 
       // Enforce pause: if the saved state is paused, reject any incoming new moves
       if (previous && previous.paused && newMoves > prevMoves) {
@@ -1111,7 +1242,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
           // Derive words and expected score
           const words = extractWordsFromBoard(incoming.board, placedTiles as any);
-          const expectedScore = calculateScore(words, incoming.board, placedTiles as any);
+          const scoreBreakdown = calculateScoreBreakdown(words, incoming.board, placedTiles as any);
+          const expectedScore = scoreBreakdown.totalScore;
 
           // Find the player whose score increased (should be the player in lastMove.playerId)
           const prevPlayer = previous.players.find(p => p.id === lastMove.playerId);
@@ -1122,6 +1254,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
           // Overwrite the client's reported move score with the server-computed expected score
           lastMove.score = expectedScore;
+          lastMove.words = scoreBreakdown.wordScores.map(entry => entry.word);
+          lastMove.wordScores = scoreBreakdown.wordScores;
+          lastMove.bingoBonus = scoreBreakdown.bingoBonus;
 
           // Update the incoming player's score to be previous + expectedScore so server is authoritative
           if (newPlayer) {
@@ -1227,42 +1362,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
           }
         }
 
-        // Detect unexplained removals: tiles present in previous.board but missing
-        // from incoming.board that are not accounted for by the validated last play.
-        try {
-          if (previous) {
-            const unexplained: Array<{ row: number; col: number; letter: string } > = [];
-            for (let r = 0; r < BOARD_SIZE; r++) {
-              for (let c = 0; c < BOARD_SIZE; c++) {
-                const prevCell = previous.board[r][c] as any;
-                const newCell = incomingState.board[r][c] as any;
-                if (prevCell && prevCell.letter) {
-                  // previously had a tile but incoming has no tile here
-                  if (!newCell || !newCell.letter) {
-                    const wasExplained = placedTilesForCount.some(p => p.row === r && p.col === c);
-                    if (!wasExplained) {
-                      unexplained.push({ row: r, col: c, letter: prevCell.letter });
-                    }
-                  }
-                }
-              }
-            }
-            if (unexplained.length > 0) {
-              console.warn('[UnexplainedBoardRemovals] incoming update removed tiles not accounted for by last validated play', {
-                ip: req.ip || req.headers['x-forwarded-for'] || null,
-                prevMoves,
-                newMoves,
-                removed: unexplained,
-                lastMoveSummary: (incoming.moves && incoming.moves.length > 0) ? incoming.moves[incoming.moves.length - 1] : null,
-                incomingTileBagLength: Array.isArray(incomingState.tileBag) ? incomingState.tileBag.length : null,
-                incomingPlayerRacks: incomingState.players ? incomingState.players.map(p => ({ id: p.id, rack: p.rack })) : null
-              });
-            }
-          }
-        } catch (err) {
-          console.error('[UnexplainedBoardRemovals] detection failed', err);
-        }
-
         // subtract tiles found on the usedBoard
         for (let r = 0; r < BOARD_SIZE; r++) {
           for (let c = 0; c < BOARD_SIZE; c++) {
@@ -1342,6 +1441,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (endCheck.ended) {
         saved.gameEnded = true;
         saved.winnerId = endCheck.winnerId;
+        saved.drawPlayerIds = endCheck.drawPlayerIds;
         saved.endReason = endCheck.reason;
         bumpRevision(saved);
         await recordCompletedGameStats(saved);
@@ -1434,6 +1534,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       else if (cached.stateRevision !== revision) missReason = 'revision-drift';
       else if (cached.wins !== (sanitizeStoredStatsEntry(lifetimeStats).wins)
         || cached.losses !== (sanitizeStoredStatsEntry(lifetimeStats).losses)
+        || cached.draws !== (sanitizeStoredStatsEntry(lifetimeStats).draws)
         || cached.games !== (sanitizeStoredStatsEntry(lifetimeStats).games)) missReason = 'lifetime-stats-drift';
       else if (now >= cached.expiresAt) missReason = 'expired';
 
@@ -1445,6 +1546,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         && cached.stateRevision === revision
         && cached.wins === totals.wins
         && cached.losses === totals.losses
+        && cached.draws === totals.draws
         && cached.games === totals.games
         && now < cached.expiresAt;
 
@@ -1706,6 +1808,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       state.pausedAt = Date.now();
       state.gameEnded = false;
       state.winnerId = undefined;
+      state.drawPlayerIds = undefined;
       state.endReason = undefined;
       state.previews = {};
 

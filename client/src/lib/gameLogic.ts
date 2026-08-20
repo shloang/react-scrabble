@@ -1,4 +1,4 @@
-import { BOARD_SIZE, SPECIAL_SQUARES, TILE_VALUES, SquareType, PlacedTile, GameState, BoardCell } from "@shared/schema";
+import { BOARD_SIZE, SPECIAL_SQUARES, TILE_VALUES, SquareType, PlacedTile, GameState, BoardCell, type MoveWordScore } from "@shared/schema";
 
 export function getSquareType(row: number, col: number): SquareType {
   for (const [type, positions] of Object.entries(SPECIAL_SQUARES)) {
@@ -101,14 +101,18 @@ export function extractWordsFromBoard(board: BoardCell[][], placedTiles: PlacedT
   return words;
 }
 
-export function calculateScore(
-  words: WordInfo[], 
-  board: BoardCell[][], 
-  placedTiles: PlacedTile[]
-): number {
-  let totalScore = 0;
+export interface ScoreBreakdown {
+  wordScores: MoveWordScore[];
+  bingoBonus: number;
+  totalScore: number;
+}
 
-  words.forEach(({ word, positions }) => {
+export function calculateWordScores(
+  words: WordInfo[],
+  board: BoardCell[][],
+  placedTiles: PlacedTile[]
+): MoveWordScore[] {
+  return words.map(({ word, positions }) => {
     let wordScore = 0;
     let wordMultiplier = 1;
 
@@ -143,15 +147,28 @@ export function calculateScore(
     });
 
     wordScore *= wordMultiplier;
-    totalScore += wordScore;
+    return { word, score: wordScore };
   });
+}
 
-  // Bonus for using all 7 tiles
-  if (placedTiles.length === 7) {
-    totalScore += 50;
-  }
+export function calculateScoreBreakdown(
+  words: WordInfo[],
+  board: BoardCell[][],
+  placedTiles: PlacedTile[]
+): ScoreBreakdown {
+  const wordScores = calculateWordScores(words, board, placedTiles);
+  const bingoBonus = placedTiles.length === 7 ? 50 : 0;
+  const totalScore = wordScores.reduce((sum, entry) => sum + entry.score, 0) + bingoBonus;
 
-  return totalScore;
+  return { wordScores, bingoBonus, totalScore };
+}
+
+export function calculateScore(
+  words: WordInfo[],
+  board: BoardCell[][],
+  placedTiles: PlacedTile[]
+): number {
+  return calculateScoreBreakdown(words, board, placedTiles).totalScore;
 }
 
 export function validatePlacement(board: BoardCell[][], placedTiles: PlacedTile[]): { valid: boolean; error?: string } {

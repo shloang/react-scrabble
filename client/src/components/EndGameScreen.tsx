@@ -1,7 +1,8 @@
-import { GameState, Player, Move } from "@shared/schema";
+import { GameState } from "@shared/schema";
 import { useEffect } from 'react';
 import { Card } from "@/components/ui/card";
 import { Trophy, Award, Target, BookOpen } from "lucide-react";
+import { getEndGameHighlights } from '@/lib/endGameStats';
 
 interface EndGameScreenProps {
   gameState: GameState;
@@ -13,46 +14,16 @@ interface EndGameScreenProps {
 
 export default function EndGameScreen({ gameState, currentPlayerId, onNewGame, onClose, onMinimize }: EndGameScreenProps) {
   const winner = (gameState.players || []).find(p => p.id === gameState.winnerId) || null;
-  const currentPlayer = (gameState.players || []).find(p => p.id === currentPlayerId) || null;
+  const drawPlayerIds = Array.isArray(gameState.drawPlayerIds) ? gameState.drawPlayerIds : [];
+  const drawPlayerSet = new Set(drawPlayerIds);
+  const drawPlayers = (gameState.players || []).filter(player => drawPlayerSet.has(player.id));
+  const isDraw = drawPlayers.length > 1;
   const isWinner = winner?.id === currentPlayerId;
+  const isDrawParticipant = isDraw && !!currentPlayerId && drawPlayerSet.has(currentPlayerId);
+  const rankedPlayers = (gameState.players || []).slice().sort((a, b) => (b.score || 0) - (a.score || 0));
 
-  // Calculate statistics
   const moves = gameState.moves || [];
-  const playMoves = moves.filter(m => m.type === 'play') as Move[];
-  
-  // Highest scored move
-  const highestMove = playMoves.reduce((prev, curr) => 
-    curr.score > prev.score ? curr : prev, 
-    { score: 0 } as Move
-  );
-
-  // Highest scored single word (approximate - use move score if only one word, otherwise divide)
-  let highestWord = { word: '', score: 0, move: null as Move | null };
-  for (const move of playMoves) {
-    if (move.words.length === 1) {
-      if (move.score > highestWord.score) {
-        highestWord = { word: move.words[0], score: move.score, move };
-      }
-    } else if (move.words.length > 1) {
-      // Approximate: divide score by number of words (not perfect but gives an idea)
-      const avgScore = Math.round(move.score / move.words.length);
-      for (const word of move.words) {
-        if (avgScore > highestWord.score) {
-          highestWord = { word, score: avgScore, move };
-        }
-      }
-    }
-  }
-
-  // Longest word
-  let longestWord = { word: '', length: 0, move: null as Move | null };
-  for (const move of playMoves) {
-    for (const word of move.words) {
-      if (word.length > longestWord.length) {
-        longestWord = { word, length: word.length, move };
-      }
-    }
-  }
+  const { highestMove, highestWord, longestWord } = getEndGameHighlights(moves);
 
   // allow backdrop click or escape key to close when `onClose` is provided
   useEffect(() => {
@@ -65,16 +36,16 @@ export default function EndGameScreen({ gameState, currentPlayerId, onNewGame, o
   }, [onClose]);
   return (
     <div
-      className="fixed inset-0 bg-black/50 flex items-start justify-center z-50 p-3 sm:p-4 overflow-hidden"
+      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-2 sm:p-3 overflow-hidden"
       onClick={() => { if (onClose) onClose(); }}
     >
-      <Card className="relative max-w-4xl w-full max-h-[calc(100dvh-1.5rem)] sm:max-h-[calc(100dvh-2rem)] overflow-y-auto p-4 sm:p-6 lg:p-8 space-y-4 sm:space-y-6" onClick={(e) => e.stopPropagation()}>
-        <div className="sticky top-0 z-10 -mt-2 -mr-2 flex justify-end gap-2">
+      <Card className="relative flex max-h-[calc(100dvh-1rem)] w-full max-w-4xl flex-col overflow-hidden p-[clamp(0.75rem,2.2vmin,1.75rem)] gap-[clamp(0.5rem,1.5vmin,1.25rem)]" onClick={(e) => e.stopPropagation()}>
+        <div className="absolute right-2 top-2 z-10 flex justify-end gap-1">
           {onMinimize && (
             <button
               aria-label="Minimize"
               onClick={onMinimize}
-              className="p-2 rounded-md hover:bg-muted/20"
+              className="h-8 w-8 rounded-md hover:bg-muted/20"
               title="Свернуть"
             >
               —
@@ -84,43 +55,47 @@ export default function EndGameScreen({ gameState, currentPlayerId, onNewGame, o
             <button
               aria-label="Close"
               onClick={onClose}
-              className="p-2 rounded-md hover:bg-muted/20"
+              className="h-8 w-8 rounded-md hover:bg-muted/20"
               title="Закрыть"
             >
               ✕
             </button>
           )}
         </div>
-        <div className="text-center">
-          <div className={`text-5xl sm:text-6xl mb-3 sm:mb-4 ${isWinner ? 'text-yellow-500' : 'text-gray-400'}`}>
-            {isWinner ? '🏆' : '😔'}
+        <div className="shrink-0 pr-16 text-center">
+          <div className={`mb-[clamp(0.25rem,1vmin,0.75rem)] text-[clamp(2rem,7vmin,4rem)] leading-none ${isWinner ? 'text-yellow-500' : isDrawParticipant ? 'text-blue-500' : 'text-gray-400'}`}>
+            {isWinner ? '🏆' : isDrawParticipant ? '🤝' : '😔'}
           </div>
-          <h1 className="text-2xl sm:text-4xl font-bold mb-2">
-            {isWinner ? 'Поздравляем! Вы выиграли!' : 'Игра окончена'}
+          <h1 className="mb-1 text-[clamp(1.35rem,4.5vmin,2.75rem)] font-bold leading-tight">
+            {isWinner ? 'Поздравляем! Вы выиграли!' : isDrawParticipant ? 'Ничья!' : 'Игра окончена'}
           </h1>
-          {winner && (
-            <p className="text-lg sm:text-2xl text-muted-foreground">
+          {isDraw ? (
+            <p className="text-[clamp(0.95rem,2.8vmin,1.5rem)] leading-snug text-muted-foreground">
+              Ничья за первое место: <span className="font-bold text-primary">{drawPlayers.map(player => player.name).join(', ')}</span>
+              {drawPlayers[0] ? ` (${drawPlayers[0].score} очков)` : ''}
+            </p>
+          ) : winner && (
+            <p className="text-[clamp(0.95rem,2.8vmin,1.5rem)] leading-snug text-muted-foreground">
               Победитель: <span className="font-bold text-primary">{winner.name}</span> ({winner.score} очков)
             </p>
           )}
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-4">
-          <Card className="p-4">
-            <div className="flex items-center gap-2 mb-2">
-              <Trophy className="w-5 h-5 text-yellow-500" />
-              <h3 className="font-semibold">Итоговые очки</h3>
+        <div className="grid min-h-0 flex-1 grid-cols-2 gap-[clamp(0.4rem,1.2vmin,1rem)]">
+          <Card className="min-h-0 overflow-hidden p-[clamp(0.65rem,1.6vmin,1rem)]">
+            <div className="mb-[clamp(0.25rem,0.8vmin,0.5rem)] flex items-center gap-2">
+              <Trophy className="h-[clamp(1rem,2.4vmin,1.25rem)] w-[clamp(1rem,2.4vmin,1.25rem)] text-yellow-500" />
+              <h3 className="text-[clamp(0.9rem,2vmin,1rem)] font-semibold">Итоговые очки</h3>
             </div>
-            <div className="space-y-3">
-              {(gameState.players || []).slice().sort((a, b) => (b.score || 0) - (a.score || 0))
-                .map((player, idx) => (
-                  <div key={player.id} className="flex justify-between items-start">
+            <div className="space-y-[clamp(0.25rem,0.9vmin,0.75rem)] text-[clamp(0.82rem,1.8vmin,1rem)] leading-tight">
+              {rankedPlayers.map((player) => (
+                  <div key={player.id} className="flex justify-between gap-3">
                     <div>
-                      <div className={player.id === gameState.winnerId ? 'font-bold' : ''}>
-                        {idx + 1}. {player.name}
+                      <div className={player.id === gameState.winnerId || drawPlayerSet.has(player.id) ? 'font-bold' : ''}>
+                        {rankedPlayers.findIndex(candidate => candidate.score === player.score) + 1}. {player.name}
                       </div>
                       {(player.originalScore !== undefined || player.tilePenalty !== undefined) && (
-                        <div className="text-xs text-muted-foreground mt-1 space-y-0.5">
+                        <div className="mt-0.5 space-y-0.5 text-[clamp(0.68rem,1.45vmin,0.75rem)] text-muted-foreground">
                           {player.originalScore !== undefined && (
                             <div>Исходные: {player.originalScore} очков</div>
                           )}
@@ -136,15 +111,15 @@ export default function EndGameScreen({ gameState, currentPlayerId, onNewGame, o
             </div>
           </Card>
 
-          <Card className="p-4">
-            <div className="flex items-center gap-2 mb-2">
-              <Award className="w-5 h-5 text-blue-500" />
-              <h3 className="font-semibold">Лучший ход</h3>
+          <Card className="min-h-0 overflow-hidden p-[clamp(0.65rem,1.6vmin,1rem)]">
+            <div className="mb-[clamp(0.25rem,0.8vmin,0.5rem)] flex items-center gap-2">
+              <Award className="h-[clamp(1rem,2.4vmin,1.25rem)] w-[clamp(1rem,2.4vmin,1.25rem)] text-blue-500" />
+              <h3 className="text-[clamp(0.9rem,2vmin,1rem)] font-semibold">Лучший ход</h3>
             </div>
-            {highestMove.score > 0 ? (
+            {highestMove && highestMove.score > 0 ? (
               <div>
-                <div className="text-2xl font-bold text-primary">{highestMove.score} очков</div>
-                <div className="text-sm text-muted-foreground mt-1">
+                <div className="text-[clamp(1.25rem,3vmin,1.75rem)] font-bold leading-tight text-primary">{highestMove.score} очков</div>
+                <div className="mt-1 text-[clamp(0.78rem,1.7vmin,0.9rem)] leading-snug text-muted-foreground">
                   {highestMove.playerName}: {highestMove.words.join(', ')}
                 </div>
               </div>
@@ -153,15 +128,15 @@ export default function EndGameScreen({ gameState, currentPlayerId, onNewGame, o
             )}
           </Card>
 
-          <Card className="p-4">
-            <div className="flex items-center gap-2 mb-2">
-              <Target className="w-5 h-5 text-green-500" />
-              <h3 className="font-semibold">Лучшее слово</h3>
+          <Card className="min-h-0 overflow-hidden p-[clamp(0.65rem,1.6vmin,1rem)]">
+            <div className="mb-[clamp(0.25rem,0.8vmin,0.5rem)] flex items-center gap-2">
+              <Target className="h-[clamp(1rem,2.4vmin,1.25rem)] w-[clamp(1rem,2.4vmin,1.25rem)] text-green-500" />
+              <h3 className="text-[clamp(0.9rem,2vmin,1rem)] font-semibold">Лучшее слово</h3>
             </div>
             {highestWord.word ? (
               <div>
-                <div className="text-2xl font-bold text-primary">{highestWord.word}</div>
-                <div className="text-sm text-muted-foreground mt-1">
+                <div className="break-words text-[clamp(1.2rem,3vmin,1.75rem)] font-bold leading-tight text-primary">{highestWord.word}</div>
+                <div className="mt-1 text-[clamp(0.78rem,1.7vmin,0.9rem)] leading-snug text-muted-foreground">
                   {highestWord.score} очков ({highestWord.move?.playerName})
                 </div>
               </div>
@@ -170,15 +145,15 @@ export default function EndGameScreen({ gameState, currentPlayerId, onNewGame, o
             )}
           </Card>
 
-          <Card className="p-4">
-            <div className="flex items-center gap-2 mb-2">
-              <BookOpen className="w-5 h-5 text-purple-500" />
-              <h3 className="font-semibold">Самое длинное слово</h3>
+          <Card className="min-h-0 overflow-hidden p-[clamp(0.65rem,1.6vmin,1rem)]">
+            <div className="mb-[clamp(0.25rem,0.8vmin,0.5rem)] flex items-center gap-2">
+              <BookOpen className="h-[clamp(1rem,2.4vmin,1.25rem)] w-[clamp(1rem,2.4vmin,1.25rem)] text-purple-500" />
+              <h3 className="text-[clamp(0.9rem,2vmin,1rem)] font-semibold">Самое длинное слово</h3>
             </div>
             {longestWord.word ? (
               <div>
-                <div className="text-2xl font-bold text-primary">{longestWord.word}</div>
-                <div className="text-sm text-muted-foreground mt-1">
+                <div className="break-words text-[clamp(1.2rem,3vmin,1.75rem)] font-bold leading-tight text-primary">{longestWord.word}</div>
+                <div className="mt-1 text-[clamp(0.78rem,1.7vmin,0.9rem)] leading-snug text-muted-foreground">
                   {longestWord.length} букв ({longestWord.move?.playerName})
                 </div>
               </div>
@@ -189,10 +164,10 @@ export default function EndGameScreen({ gameState, currentPlayerId, onNewGame, o
         </div>
 
         {onNewGame && (
-          <div className="sticky bottom-0 -mb-2 bg-card/95 backdrop-blur text-center pt-3 pb-2">
+          <div className="shrink-0 text-center">
             <button
               onClick={onNewGame}
-              className="px-6 py-3 bg-primary text-primary-foreground rounded-lg font-semibold hover:bg-primary/90 transition-colors"
+              className="rounded-lg bg-primary px-[clamp(1rem,3vmin,1.5rem)] py-[clamp(0.55rem,1.7vmin,0.75rem)] text-[clamp(0.9rem,2vmin,1rem)] font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
             >
               Новая игра
             </button>

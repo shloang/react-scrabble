@@ -63,6 +63,11 @@ export interface PlacedTile {
   blank?: boolean;
 }
 
+export interface MoveWordScore {
+  word: string;
+  score: number;
+}
+
 export interface Move {
   playerId: string;
   playerName: string;
@@ -72,6 +77,9 @@ export interface Move {
   timestamp: number;
   type?: 'play' | 'skip' | 'exchange';
   meta?: Record<string, any> | null;
+  // Individual word scores exclude the 50-point all-tiles bonus.
+  wordScores?: MoveWordScore[];
+  bingoBonus?: number;
 }
 
 export type BoardCell = { letter: string; blank?: boolean } | null;
@@ -87,6 +95,8 @@ export interface GameState {
   previews?: Record<string, PlacedTile[]>;
   gameEnded?: boolean;
   winnerId?: string;
+  // Present when two or more players share the highest final score.
+  drawPlayerIds?: string[];
   endReason?: string;
   // Whether the game is currently paused (clients should stop timers)
   paused?: boolean;
@@ -149,7 +159,12 @@ export const gameStateSchema = z.object({
     turn: z.number(),
     timestamp: z.number(),
     type: z.enum(['play', 'skip', 'exchange']).optional(),
-    meta: z.record(z.any()).nullable().optional()
+    meta: z.record(z.any()).nullable().optional(),
+    wordScores: z.array(z.object({
+      word: z.string(),
+      score: z.number(),
+    })).optional(),
+    bingoBonus: z.number().nonnegative().optional(),
   })).optional(),
   previews: z.record(z.array(z.object({ row: z.number(), col: z.number(), letter: z.string(), blank: z.boolean().optional() }))).optional(),
   paused: z.boolean().optional(),

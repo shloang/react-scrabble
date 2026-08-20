@@ -1,4 +1,4 @@
-export type PlayerStats = { wins: number; losses: number; games: number };
+export type PlayerStats = { wins: number; losses: number; draws: number; games: number };
 
 const STORAGE_KEY = 'rs_player_stats';
 
@@ -12,8 +12,9 @@ function safeParse(raw: string | null): Record<string, PlayerStats> {
       if (typeof val !== 'object' || val === null) continue;
       const wins = Number((val as any).wins) || 0;
       const losses = Number((val as any).losses) || 0;
+      const draws = Number((val as any).draws) || 0;
       const games = Number((val as any).games) || 0;
-      out[key] = { wins, losses, games };
+      out[key] = { wins, losses, draws, games };
     }
     return out;
   } catch {
@@ -41,13 +42,13 @@ export function saveAll(all: Record<string, PlayerStats>): void {
 
 export function getStats(playerId: string): PlayerStats {
   const all = loadAll();
-  return all[playerId] ?? { wins: 0, losses: 0, games: 0 };
+  return all[playerId] ?? { wins: 0, losses: 0, draws: 0, games: 0 };
 }
 
 export function incrementWin(playerId: string): PlayerStats {
   const all = loadAll();
-  const prev = all[playerId] ?? { wins: 0, losses: 0, games: 0 };
-  const next: PlayerStats = { wins: prev.wins + 1, losses: prev.losses, games: prev.games + 1 };
+  const prev = all[playerId] ?? { wins: 0, losses: 0, draws: 0, games: 0 };
+  const next: PlayerStats = { wins: prev.wins + 1, losses: prev.losses, draws: prev.draws, games: prev.games + 1 };
   all[playerId] = next;
   saveAll(all);
   return next;
@@ -55,8 +56,17 @@ export function incrementWin(playerId: string): PlayerStats {
 
 export function incrementLoss(playerId: string): PlayerStats {
   const all = loadAll();
-  const prev = all[playerId] ?? { wins: 0, losses: 0, games: 0 };
-  const next: PlayerStats = { wins: prev.wins, losses: prev.losses + 1, games: prev.games + 1 };
+  const prev = all[playerId] ?? { wins: 0, losses: 0, draws: 0, games: 0 };
+  const next: PlayerStats = { wins: prev.wins, losses: prev.losses + 1, draws: prev.draws, games: prev.games + 1 };
+  all[playerId] = next;
+  saveAll(all);
+  return next;
+}
+
+export function incrementDraw(playerId: string): PlayerStats {
+  const all = loadAll();
+  const prev = all[playerId] ?? { wins: 0, losses: 0, draws: 0, games: 0 };
+  const next: PlayerStats = { wins: prev.wins, losses: prev.losses, draws: prev.draws + 1, games: prev.games + 1 };
   all[playerId] = next;
   saveAll(all);
   return next;

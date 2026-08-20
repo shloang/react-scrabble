@@ -16,6 +16,7 @@ interface BoardSquareProps {
   onDrop?: (row: number, col: number, data: any) => void;
   highlight?: 'valid' | 'invalid' | 'checking' | null;
   isLastMove?: boolean;
+  canDragTile?: boolean;
   preview?: { letter: string; isBlank?: boolean; playerId?: string } | null;
 }
 
@@ -43,6 +44,9 @@ function BoardTile({
   letter,
   isBlankPlaced,
   isLastMove,
+  isNewlyPlaced,
+  highlight,
+  canDrag,
   onClick,
 }: {
   row: number;
@@ -50,20 +54,33 @@ function BoardTile({
   letter: string;
   isBlankPlaced?: boolean;
   isLastMove?: boolean;
+  isNewlyPlaced?: boolean;
+  highlight?: 'valid' | 'invalid' | 'checking' | null;
+  canDrag?: boolean;
   onClick?: () => void;
 }) {
   const { ref: containerRef, size } = useElementSize<HTMLDivElement>();
   const tileSize = Math.min(size.width, size.height);
   const fontStyle: React.CSSProperties = tileSize ? { fontSize: Math.max(10, Math.round(tileSize * 0.5)) + 'px' } : {};
+  const outlineClass = highlight === 'valid'
+    ? 'ring-[3px] ring-green-500 dark:ring-green-400'
+    : highlight === 'invalid'
+      ? 'ring-[3px] ring-red-500 dark:ring-red-400'
+      : highlight === 'checking'
+        ? 'ring-2 ring-yellow-400 dark:ring-yellow-300'
+        : isNewlyPlaced
+          ? 'ring-2 ring-primary'
+          : '';
 
   return (
-    <div ref={containerRef} className="w-[85%] h-[85%]">
+    <div ref={containerRef} className={`w-[85%] h-[85%] rounded-md transition-shadow ${outlineClass}`}>
       <Tile
         letter={letter}
         isBlank={!!isBlankPlaced}
         style={{ ...fontStyle, compactBadge: true } as any}
         onClick={onClick}
-        onDragStart={(e) => {
+        draggable={!!canDrag}
+        onDragStart={canDrag ? (e) => {
           try {
             e.dataTransfer.setData('text/plain', JSON.stringify({ source: 'board', fromRow: row, fromCol: col, letter }));
             e.dataTransfer.effectAllowed = 'move';
@@ -81,15 +98,15 @@ function BoardTile({
           } catch (err) {
             // ignore
           }
-        }}
-        onDragEnd={() => { document.body.classList.remove('dragging'); }}
+        } : undefined}
+        onDragEnd={canDrag ? () => { document.body.classList.remove('dragging'); } : undefined}
         isSelected={isLastMove}
       />
     </div>
   );
 }
 
-function BoardSquare({ row, col, type, letter, isNewlyPlaced, isBlankPlaced, isTypingCursor, onClick, onSquareClick, onDrop, highlight, isLastMove, preview }: BoardSquareProps) {
+function BoardSquare({ row, col, type, letter, isNewlyPlaced, isBlankPlaced, isTypingCursor, onClick, onSquareClick, onDrop, highlight, isLastMove, canDragTile, preview }: BoardSquareProps) {
   const hasLetter = letter !== null;
   const handleClick = onClick || (onSquareClick ? () => onSquareClick(row, col) : undefined);
 
@@ -137,10 +154,6 @@ function BoardSquare({ row, col, type, letter, isNewlyPlaced, isBlankPlaced, isT
         aspect-square border border-border/30 flex items-center justify-center relative
         ${!hasLetter ? SQUARE_COLORS[type] : 'bg-background'}
         ${handleClick && !hasLetter ? 'cursor-pointer hover:opacity-80' : ''}
-        ${isNewlyPlaced ? 'ring-2 ring-primary ring-inset' : ''}
-        ${highlight === 'valid' ? 'ring-4 ring-green-400/60' : ''}
-        ${highlight === 'invalid' ? 'ring-4 ring-red-400/60' : ''}
-        ${highlight === 'checking' ? 'ring-2 ring-yellow-300/60' : ''}
       `}
       data-testid={`square-${row}-${col}`}
     >
@@ -151,6 +164,9 @@ function BoardSquare({ row, col, type, letter, isNewlyPlaced, isBlankPlaced, isT
           letter={letter}
           isBlankPlaced={isBlankPlaced}
           isLastMove={isLastMove}
+          isNewlyPlaced={isNewlyPlaced}
+          highlight={highlight}
+          canDrag={!!isNewlyPlaced && !!canDragTile}
           onClick={handleClick}
         />
       ) : (
@@ -211,6 +227,7 @@ export default memo(BoardSquare, (prev, next) => (
   prev.isTypingCursor === next.isTypingCursor &&
   prev.highlight === next.highlight &&
   prev.isLastMove === next.isLastMove &&
+  prev.canDragTile === next.canDragTile &&
   samePreview(prev.preview, next.preview) &&
   prev.onClick === next.onClick &&
   prev.onSquareClick === next.onSquareClick &&

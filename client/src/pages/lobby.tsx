@@ -10,6 +10,7 @@ import { getGameState, updateGameState, leaveGame, kickPlayer, resetSession as r
 import { useToast } from '@/hooks/use-toast';
 import { getStats } from '@/lib/playerStats';
 import { deriveCacheBadgeState } from '@/lib/statsCacheDisplay';
+import { hasGameInProgress } from '@/lib/sessionPhase';
 import JoinGameDialog from '@/components/JoinGameDialog';
 import handleInvalidSession from '@/lib/session';
 import { joinGame as joinGameApi } from '@/lib/gameApi';
@@ -19,10 +20,6 @@ const VoiceChat = lazy(() => import('@/components/VoiceChat'));
 
 const MAX_AVATAR_UPLOAD_BYTES = 262144;
 const MAX_AVATAR_DATA_URL_LENGTH = 360000;
-
-function hasGameInProgress(state: any): boolean {
-  return !!state?.currentPlayer && (state?.turn || 0) > 0 && !state?.gameEnded;
-}
 
 type CacheTelemetryPayload = {
   playerId: string;
@@ -92,6 +89,7 @@ export default function Lobby() {
     score?: number;
     wins: number;
     losses: number;
+    draws: number;
     games: number;
     cachedAt?: number | null;
     staleAt?: number | null;
@@ -874,6 +872,7 @@ export default function Lobby() {
     const displayStats = {
       wins: Number(serverStats?.wins ?? localStats?.wins) || 0,
       losses: Number(serverStats?.losses ?? localStats?.losses) || 0,
+      draws: Number(serverStats?.draws ?? localStats?.draws) || 0,
       games: Number(serverStats?.games ?? localStats?.games) || 0,
       score: serverStats?.score ?? player.score,
       cachedAt: serverStats?.cachedAt ?? null,
@@ -927,7 +926,7 @@ export default function Lobby() {
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold leading-tight">{player.name}</div>
               <div className="text-xs text-muted-foreground">
-                Очки: {formatStatsNumber(player.score)} • П {formatStatsNumber(displayStats.wins)} • Пор {formatStatsNumber(displayStats.losses)} • Игр {formatStatsNumber(displayStats.games)}
+                Очки: {formatStatsNumber(player.score)} • Поб {formatStatsNumber(displayStats.wins)} • Пор {formatStatsNumber(displayStats.losses)} • Нич {formatStatsNumber(displayStats.draws)} • Игр {formatStatsNumber(displayStats.games)}
               </div>
             </div>
           <div
@@ -959,10 +958,10 @@ export default function Lobby() {
           </div>
           <div className="hidden gap-1 text-xs text-muted-foreground sm:text-right">
             <div>
-              Локально: победы {formatStatsNumber(localStats?.wins)}, поражения {formatStatsNumber(localStats?.losses)}, игр {formatStatsNumber(localStats?.games)}
+              Локально: победы {formatStatsNumber(localStats?.wins)}, поражения {formatStatsNumber(localStats?.losses)}, ничьи {formatStatsNumber(localStats?.draws)}, игр {formatStatsNumber(localStats?.games)}
             </div>
             <div className={serverStatsError ? 'text-destructive' : ''}>
-              Итоги: победы {formatStatsNumber(displayStats.wins)}, поражения {formatStatsNumber(displayStats.losses)}, игр {formatStatsNumber(displayStats.games)}
+              Итоги: победы {formatStatsNumber(displayStats.wins)}, поражения {formatStatsNumber(displayStats.losses)}, ничьи {formatStatsNumber(displayStats.draws)}, игр {formatStatsNumber(displayStats.games)}
               {serverStatsError ? ' (серверный снимок недоступен)' : ''}
             </div>
             {Number.isFinite(serverStats?.cachedAt) || Number.isFinite(serverStats?.staleAt) || Number.isFinite(serverStats?.expiresAt) ? (

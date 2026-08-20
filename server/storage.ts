@@ -6,6 +6,7 @@ import path from 'path';
 export type StoredPlayerStatsEntry = {
   wins: number;
   losses: number;
+  draws: number;
   games: number;
   updatedAt: number;
   lastGameKey?: string;

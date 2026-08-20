@@ -20,7 +20,8 @@ import { useToast } from '@/hooks/use-toast';
 import { useAudioKeepAlive } from '@/hooks/useAudioKeepAlive';
 import { usePlayerTileOrder } from '@/hooks/usePlayerTileOrder';
 import { useLocation } from 'wouter';
-import { getStats, incrementWin, incrementLoss, getAllStats } from '@/lib/playerStats';
+import { getStats, incrementWin, incrementLoss, incrementDraw, getAllStats } from '@/lib/playerStats';
+import { shouldRouteGameToLobby } from '@/lib/sessionPhase';
 
 const EMPTY_PREVIEWS: Record<string, PlacedTile[]> = {};
 
@@ -70,6 +71,8 @@ export default function Game() {
   const [, setLocation] = useLocation();
   const statsUpdatedRef = useRef<boolean>(false);
   const lastTurnStartRef = useRef<number | null>(null);
+  const turnActionInFlightRef = useRef<'submit' | 'skip' | null>(null);
+  const timerExpiryPendingRef = useRef(false);
 
   // Sync dark mode state to document and localStorage
   useEffect(() => {
@@ -125,11 +128,11 @@ export default function Game() {
       try {
         audio.currentTime = 0;
       } catch (err) { /* ignore */ }
-      
+
       // Ensure AudioContext is running before playing
       audioKeepAlive.ensureAudioContext();
       audioKeepAlive.resumeAudioContext();
-      
+
       audio.play().catch(err => console.error('Failed to play sound:', err));
     } catch (err) {
       console.error('Failed to load sound:', err);
@@ -182,6 +185,13 @@ export default function Game() {
       setIsJoining(false);
     }
   }, [gameState, playerId]);
+
+  // A host reload can reopen the app at `/` after a server restart. Respect
+  // the persisted session phase instead of rendering a lobby as a new game.
+  useEffect(() => {
+    if (isJoining) return;
+    if (shouldRouteGameToLobby(gameState, playerId)) setLocation('/lobby');
+  }, [gameState, playerId, isJoining, setLocation]);
 
   const joinMutation = useMutation({
     mutationFn: (vars: { name: string; password: string }) => joinGameApi(vars.name, vars.password),
@@ -370,16 +380,19 @@ export default function Game() {
     // Derived client-side preview state and helpers
     const getCurrentPlayer = useCallback(() => gameState?.players?.find(p => p.id === playerId) || null, [gameState?.players, playerId]);
 
+    const serverBoard = gameState?.board ?? null;
     const clientBoardState = useMemo(() => {
-      if (!gameState) return null;
-        const b = structuredClone(gameState.board);
-        for (const t of placedTiles) {
-          if (!Array.isArray(b)) continue;
-          if (!Array.isArray(b[t.row])) continue;
-          b[t.row][t.col] = { letter: t.letter, blank: !!t.blank } as any;
-        }
+      if (!serverBoard) return null;
+      if (!placedTiles || placedTiles.length === 0) return serverBoard;
+
+      const b = structuredClone(serverBoard);
+      for (const t of placedTiles) {
+        if (!Array.isArray(b)) continue;
+        if (!Array.isArray(b[t.row])) continue;
+        b[t.row][t.col] = { letter: t.letter, blank: !!t.blank } as any;
+      }
       return b;
-    }, [gameState, placedTiles]);
+    }, [serverBoard, placedTiles]);
 
     const clientRackState = useMemo(() => {
       if (!gameState || !playerId) return null;
@@ -480,20 +493,26 @@ export default function Game() {
       return [] as { row: number; col: number }[];
     }, [gameState?.moves]);
 
+    const clearPlacedWordPreview = useCallback(() => {
+      setPlacedWordStatuses(prev => prev.length === 0 ? prev : []);
+      setPotentialScore(prev => prev === null ? prev : null);
+    }, []);
+
     // When placedTiles or preview board changes, validate placed words and compute potential score
     useEffect(() => {
-      if (!gameState) return;
-      const board = clientBoardState || gameState.board;
+      const board = clientBoardState || serverBoard;
+      if (!board) {
+        clearPlacedWordPreview();
+        return;
+      }
       if (!placedTiles || placedTiles.length === 0) {
-        setPlacedWordStatuses([]);
-        setPotentialScore(null);
+        clearPlacedWordPreview();
         return;
       }
 
       const words = extractWordsFromBoard(board, placedTiles);
       if (!words || words.length === 0) {
-        setPlacedWordStatuses([]);
-        setPotentialScore(null);
+        clearPlacedWordPreview();
         return;
       }
 
@@ -533,7 +552,7 @@ export default function Game() {
       })();
 
       return () => { cancelled = true; };
-    }, [placedTiles, clientBoardState, gameState]);
+    }, [placedTiles, clientBoardState, serverBoard, clearPlacedWordPreview]);
 
     // Play turn sound on all turn switches
   useEffect(() => {
@@ -541,6 +560,7 @@ export default function Game() {
 
     // Play turn-change sound only when current player changed (avoid duplicate plays)
     if (previousCurrentPlayer !== null && gameState.currentPlayer !== previousCurrentPlayer) {
+      timerExpiryPendingRef.current = false;
       if (!gameState.gameEnded) {
         playSound('turn.mp3');
       }
@@ -559,10 +579,13 @@ export default function Game() {
   useEffect(() => {
     if (!gameState || !playerId || !gameState.gameEnded || hasPlayedEndGameSound) return;
 
+    const drawPlayerIds = Array.isArray(gameState.drawPlayerIds) ? gameState.drawPlayerIds : [];
+    const isDraw = drawPlayerIds.length > 1;
     const isWinner = gameState.winnerId === playerId;
+    const isDrawParticipant = isDraw && drawPlayerIds.includes(playerId);
     if (isWinner) {
       playSound('win.mp3');
-    } else {
+    } else if (!isDrawParticipant) {
       playSound('lose.mp3');
     }
     setHasPlayedEndGameSound(true);
@@ -570,17 +593,24 @@ export default function Game() {
     // Update local player stats once per finished game
     try {
       if (!statsUpdatedRef.current) {
-        const winnerId = gameState.winnerId;
-        if (winnerId) incrementWin(winnerId);
-        for (const p of (gameState.players || [])) {
-          if (p.id !== winnerId) incrementLoss(p.id);
+        if (isDraw) {
+          const drawPlayerSet = new Set(drawPlayerIds);
+          for (const player of (gameState.players || [])) {
+            if (drawPlayerSet.has(player.id)) incrementDraw(player.id);
+            else incrementLoss(player.id);
+          }
+        } else if (gameState.winnerId) {
+          incrementWin(gameState.winnerId);
+          for (const player of (gameState.players || [])) {
+            if (player.id !== gameState.winnerId) incrementLoss(player.id);
+          }
         }
         statsUpdatedRef.current = true;
       }
     } catch (err) {
       // ignore stats update errors
     }
-  }, [gameState?.gameEnded, gameState?.winnerId, playerId, hasPlayedEndGameSound]);
+  }, [gameState?.gameEnded, gameState?.winnerId, gameState?.drawPlayerIds, playerId, hasPlayedEndGameSound]);
 
   // Show end-screen overlay when game ends; allow local dismissal
   useEffect(() => {
@@ -654,9 +684,12 @@ export default function Game() {
   }, [gameState?.currentPlayer, playerId, soundVolume]);
 
   const handleTimerExpired = useCallback(() => {
-    if (gameState?.currentPlayer === playerId) {
-      handleSkipTurn();
+    if (gameState?.currentPlayer !== playerId) return;
+    if (turnActionInFlightRef.current) {
+      timerExpiryPendingRef.current = true;
+      return;
     }
+    void handleSkipTurn();
   }, [gameState?.currentPlayer, playerId]);
 
   // Note: server now manages `pausedAt` and `turnStart`; GameTimer renders the local countdown.
@@ -865,7 +898,7 @@ export default function Game() {
   // (no global event usage now)
 
   const handleSquareClick = useCallback(async (row: number, col: number) => {
-          if (!gameState) return;
+    if (!gameState || gameState.gameEnded || gameState.paused || isValidating) return;
     
     const currentPlayer = getCurrentPlayer();
     if (!currentPlayer) return;
@@ -924,7 +957,7 @@ export default function Game() {
       setTypedSequence(prev => prev.filter(t => !(t.row === row && t.col === col)));
       // No server update - client-side only
     }
-  }, [clientBoardState, clientRackState, gameState, getCurrentPlayer, placedTiles, playSound, selectedTileIndex, toServerRackIndex, typingCursor]);
+  }, [clientBoardState, clientRackState, gameState, getCurrentPlayer, isValidating, placedTiles, playSound, selectedTileIndex, toServerRackIndex, typingCursor]);
 
   const handleTileClick = useCallback((index: number) => {
     if (discardMode) {
@@ -957,19 +990,22 @@ export default function Game() {
 
   // Drop a placed board tile into a rack slot (or swap) - client-side only
   const handleDropFromBoard = useCallback(async (fromRow: number, fromCol: number, toIndex: number) => {
-    if (!gameState) return;
+    if (!gameState || gameState.gameEnded || gameState.paused || isValidating) return;
+    if (!Number.isInteger(fromRow) || !Number.isInteger(fromCol) || !Number.isInteger(toIndex)) return;
+
+    const placedEntry = placedTiles.find(t => t.row === fromRow && t.col === fromCol) as any;
+    if (!placedEntry || gameState.board[fromRow]?.[fromCol]) return;
+
     const currentPlayer = getCurrentPlayer();
     if (!currentPlayer) return;
 
     const boardToCheck = clientBoardState || gameState.board;
-    const tileCell = boardToCheck[fromRow][fromCol] as any;
+    const tileCell = boardToCheck[fromRow]?.[fromCol] as any;
     if (!tileCell) return;
-    const tileLetter = tileCell.letter as string | undefined;
-    const placedEntry = placedTiles.find(t => t.row === fromRow && t.col === fromCol) as any;
-    const isBlank = !!tileCell.blank || !!placedEntry?.blank;
 
     const serverRackIndex = toServerRackIndex(toIndex);
     const rackToCheck = clientRackState || currentPlayer.rack;
+    if (serverRackIndex < 0 || serverRackIndex >= rackToCheck.length) return;
     const rackVal = rackToCheck[serverRackIndex];
 
     // If target rack slot is empty, move board tile into it (client-side only)
@@ -1003,10 +1039,10 @@ export default function Game() {
       }
       return without;
     });
-  }, [clientBoardState, clientRackState, gameState, getCurrentPlayer, placedTiles, toServerRackIndex]);
+  }, [clientBoardState, clientRackState, gameState, getCurrentPlayer, isValidating, placedTiles, toServerRackIndex]);
 
   const handleBoardTileDrop = useCallback(async (row: number, col: number, data: any) => {
-    if (!gameState) return;
+    if (!gameState || gameState.gameEnded || gameState.paused || isValidating) return;
 
     const currentPlayer = getCurrentPlayer();
     if (!currentPlayer) return;
@@ -1128,7 +1164,7 @@ export default function Game() {
     } catch (err) {
       console.error('[Drop] error', err);
     }
-  }, [clientBoardState, clientRackState, gameState, getCurrentPlayer, placedTiles, playerId, playSound, toServerRackIndex]);
+  }, [clientBoardState, clientRackState, gameState, getCurrentPlayer, isValidating, placedTiles, playerId, playSound, toServerRackIndex]);
 
   const handleConfirmBlank = async (assigned: string) => {
     if (!blankAssign || !gameState) {
@@ -1187,56 +1223,22 @@ export default function Game() {
     setSelectedDiscardIndices([]);
   }, [gameState, getCurrentPlayer, tileOrder]);
 
-  const handleRecall = useCallback(async () => {
+  const handleRecall = useCallback(() => {
     if (!gameState || placedTiles.length === 0) return;
     if (gameState.paused) {
       toast({ variant: 'destructive', title: 'Игра приостановлена', description: 'Нельзя изменять состояние во время паузы' });
       return;
     }
-    const currentPlayer = getCurrentPlayer();
-    if (!currentPlayer) return;
-
-    const freshState = await getGameState();
-    const newState = structuredClone(freshState || gameState);
-    const newPlayer = Array.isArray(newState.players) ? newState.players.find(p => p.id === playerId) : undefined;
-    if (!newPlayer) return;
-
-    // Return placed tiles to player's rack. Prefer to return to the original
-    // rack index recorded in typedSequence (fromRackIndex). If that isn't
-    // available, put into the first `null` slot. As a last resort overwrite the
-    // first slot to avoid losing tiles.
-    for (const placed of placedTiles) {
-      const { row, col, letter, blank } = placed as any;
-      newState.board[row][col] = null;
-
-      // try find typedSequence entry for this placed tile
-      const typed = typedSequence.find(t => t.row === row && t.col === col && typeof t.fromRackIndex === 'number');
-      if (typed && typeof typed.fromRackIndex === 'number') {
-        const idx = typed.fromRackIndex;
-        if (idx >= 0 && idx < newPlayer.rack.length) {
-          newPlayer.rack[idx] = typed.blank ? '?' : typed.letter;
-          continue;
-        }
-      }
-
-      const emptyIndex = newPlayer.rack.findIndex(t => t === null);
-      if (emptyIndex !== -1) {
-        newPlayer.rack[emptyIndex] = blank ? '?' : letter;
-        continue;
-      }
-
-      // last resort: overwrite first slot to avoid dropping the tile entirely
-      newPlayer.rack[0] = blank ? '?' : letter;
-    }
-
+    // Placements do not touch server state until a play is accepted. Clearing
+    // the local overlay restores the authoritative rack without a state write.
     setPlacedTiles([]);
     setTypedSequence([]);
     setSelectedTileIndex(null);
-    await updateMutation.mutateAsync(newState);
-  }, [gameState, placedTiles, playerId, toast, typedSequence, updateMutation]);
+  }, [gameState, placedTiles.length, toast]);
 
   const handleSubmitMove = async () => {
     if (!gameState || gameState.currentPlayer !== playerId || placedTiles.length === 0) return;
+    if (turnActionInFlightRef.current) return;
     if (gameState.paused) {
       toast({ variant: 'destructive', title: 'Игра приостановлена', description: 'Нельзя сделать ход во время паузы' });
       return;
@@ -1257,6 +1259,8 @@ export default function Game() {
       return;
     }
 
+    turnActionInFlightRef.current = 'submit';
+    let submitAccepted = false;
     setIsValidating(true);
     setValidationMessage('');
     setIsError(false);
@@ -1367,6 +1371,7 @@ export default function Game() {
       });
 
       await updateMutation.mutateAsync(newState);
+      submitAccepted = true;
 
       setPlacedTiles([]);
       setTypedSequence([]);
@@ -1385,6 +1390,15 @@ export default function Game() {
         setValidationMessage('');
         setIsError(false);
       }, 3000);
+    } finally {
+      setIsValidating(false);
+      if (turnActionInFlightRef.current === 'submit') {
+        turnActionInFlightRef.current = null;
+      }
+      if (timerExpiryPendingRef.current) {
+        timerExpiryPendingRef.current = false;
+        if (!submitAccepted) void handleSkipTurn();
+      }
     }
   };
 
@@ -1393,6 +1407,7 @@ export default function Game() {
 
   const handleSkipTurn = async () => {
     if (!gameState || gameState.currentPlayer !== playerId) return;
+    if (turnActionInFlightRef.current) return;
     if (gameState.paused) {
       toast({ variant: 'destructive', title: 'Игра приостановлена', description: 'Нельзя пропустить ход во время паузы' });
       return;
@@ -1400,42 +1415,50 @@ export default function Game() {
     const pid = playerId;
     if (!pid) return;
 
-    // Return tiles to rack first if any placed
-    if (placedTiles.length > 0) {
-      await handleRecall();
-      // Refetch to get updated state after recall
-      await refetch();
-    }
+    turnActionInFlightRef.current = 'skip';
+    setIsValidating(true);
+    setPlacedTiles([]);
+    setTypedSequence([]);
+    setSelectedTileIndex(null);
 
-    // Get fresh state and advance turn
-    const freshState = await refetch();
-    if (!freshState.data) return;
+    try {
+      const freshState = await getGameState();
+      if (!freshState || freshState.currentPlayer !== pid) {
+        await refetch();
+        return;
+      }
 
-    const newState = structuredClone(freshState.data);
-    const currentIndex = Array.isArray(newState.players) ? newState.players.findIndex(p => p.id === playerId) : -1;
-    const playersLen = Array.isArray(newState.players) ? newState.players.length : 0;
-    if (playersLen === 0) {
-      newState.currentPlayer = null;
-    } else {
-      const nextIndex = (currentIndex + 1) % playersLen;
-      newState.currentPlayer = (Array.isArray(newState.players) ? newState.players[nextIndex] : undefined)?.id ?? null;
+      const newState = structuredClone(freshState);
+      const currentIndex = newState.players.findIndex(p => p.id === pid);
+      if (currentIndex < 0 || newState.players.length === 0) return;
+
+      const nextIndex = (currentIndex + 1) % newState.players.length;
+      newState.currentPlayer = newState.players[nextIndex]?.id ?? null;
       newState.turn += 1;
-    }
-    // Append skip entry to history
-    newState.moves = newState.moves || [];
-    const skipPlayer = Array.isArray(newState.players) ? newState.players.find(p => p.id === playerId) : undefined;
-    newState.moves.push({
-      playerId: pid,
-      playerName: skipPlayer?.name || '',
-      words: [],
-      score: 0,
-      turn: newState.turn,
-      timestamp: Date.now(),
-      type: 'skip',
-      meta: null
-    });
+      newState.moves = newState.moves || [];
+      const skipPlayer = newState.players[currentIndex];
+      newState.moves.push({
+        playerId: pid,
+        playerName: skipPlayer?.name || '',
+        words: [],
+        score: 0,
+        turn: newState.turn,
+        timestamp: Date.now(),
+        type: 'skip',
+        meta: null
+      });
 
-    await updateMutation.mutateAsync(newState);
+      await updateMutation.mutateAsync(newState);
+    } catch (error) {
+      console.error('[Skip] failed', error);
+      try { await refetch(); } catch {}
+    } finally {
+      setIsValidating(false);
+      timerExpiryPendingRef.current = false;
+      if (turnActionInFlightRef.current === 'skip') {
+        turnActionInFlightRef.current = null;
+      }
+    }
   };
 
   const handleStartDiscard = () => {
@@ -1614,6 +1637,7 @@ export default function Game() {
   };
 
   const isCurrentPlayer = gameState?.currentPlayer === playerId;
+  const canEditLocalPlacement = !isJoining && !gameState?.gameEnded && !gameState?.paused && !isValidating;
   const allPlayersVoiceEnabled = useMemo(
     () => !!gameState?.players?.length && gameState.players.every((player) => !!player.voiceEnabled),
     [gameState?.players]
@@ -1802,7 +1826,9 @@ export default function Game() {
             <div className="w-full flex-1 min-h-0 flex items-center justify-center">
               <GameBoard
                 board={clientBoardState || gameState.board}
+                committedBoard={gameState.board}
                 placedTiles={placedTiles}
+                canEditPlacedTiles={canEditLocalPlacement}
                 typingCursor={typingCursor}
                 placedWordStatuses={placedWordStatuses}
                 lastMovePositions={lastMovePositions}
@@ -1889,7 +1915,7 @@ export default function Game() {
                     onReorder={stableHandleReorderRack}
                     onDropFromBoard={stableHandleDropFromBoard}
                     // Disable interactions when the game has ended
-                    canInteract={!isJoining && !gameState?.gameEnded && !gameState?.paused}
+                    canInteract={canEditLocalPlacement}
                     canShuffle={!isJoining && !gameState?.gameEnded && !gameState?.paused}
                     isPaused={!!gameState?.paused}
                   />

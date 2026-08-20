@@ -10,7 +10,7 @@ type StorageLike = {
   getGameState: () => Promise<GameState | undefined>;
   saveGameState: (gameState: GameState) => Promise<void>;
   setPlayerPassword?: (playerId: string, password: string) => Promise<void>;
-  savePlayerStats?: (stats: Record<string, { wins: number; losses: number; games: number; updatedAt: number; lastGameKey?: string }>) => Promise<void>;
+  savePlayerStats?: (stats: Record<string, { wins: number; losses: number; draws?: number; games: number; updatedAt: number; lastGameKey?: string }>) => Promise<void>;
 };
 
 let baseUrl = '';
@@ -177,6 +177,7 @@ test('keeps lifetime stats when cache metadata expires', async () => {
   assert.equal(first.status, 200);
   assert.equal(first.body.wins, 3);
   assert.equal(first.body.losses, 2);
+  assert.equal(first.body.draws, 0);
   assert.equal(first.body.games, 5);
 
   setFakeNow(Number(first.body.expiresAt) + 1);
@@ -185,6 +186,7 @@ test('keeps lifetime stats when cache metadata expires', async () => {
   assert.equal(second.body.cacheStatus, 'fresh');
   assert.equal(second.body.wins, 3);
   assert.equal(second.body.losses, 2);
+  assert.equal(second.body.draws, 0);
   assert.equal(second.body.games, 5);
 });
 
@@ -225,6 +227,54 @@ test('records ended game stats once and reuses them after reset', async () => {
   assert.equal(loserStats.body.wins, 0);
   assert.equal(loserStats.body.losses, 1);
   assert.equal(loserStats.body.games, 1);
+});
+
+test('records tied leaders as draws while lower-scoring players receive a loss', async () => {
+  if (storage.savePlayerStats) {
+    await storage.savePlayerStats({
+      p1: { wins: 3, losses: 2, games: 5, updatedAt: 1_700_001_000_000 },
+    });
+  }
+
+  const endedState = makeState({
+    revision: 20,
+    started: true,
+    players: [
+      makePlayer('p1', 'Alice', 42),
+      makePlayer('p2', 'Bob', 42),
+      makePlayer('p3', 'Carol', 31),
+    ],
+  });
+  endedState.gameEnded = true;
+  endedState.winnerId = undefined;
+  endedState.drawPlayerIds = ['p1', 'p2'];
+  endedState.endReason = 'all_skipped_twice';
+  endedState.sessionCreatedAt = 1_700_001_100_000;
+  endedState.moves = [
+    { playerId: 'p3', playerName: 'Carol', words: [], score: 0, turn: 9, timestamp: 1_700_001_110_000, type: 'skip' },
+  ];
+  await storage.saveGameState(endedState);
+
+  setFakeNow(1_700_001_120_000);
+  const alice = await getStats('/api/player-stats/p1');
+  const bob = await getStats('/api/player-stats/p2');
+  const carol = await getStats('/api/player-stats/p3');
+
+  assert.deepEqual(
+    { wins: alice.body.wins, losses: alice.body.losses, draws: alice.body.draws, games: alice.body.games },
+    { wins: 3, losses: 2, draws: 1, games: 6 },
+  );
+  assert.deepEqual(
+    { wins: bob.body.wins, losses: bob.body.losses, draws: bob.body.draws, games: bob.body.games },
+    { wins: 0, losses: 0, draws: 1, games: 1 },
+  );
+  assert.deepEqual(
+    { wins: carol.body.wins, losses: carol.body.losses, draws: carol.body.draws, games: carol.body.games },
+    { wins: 0, losses: 1, draws: 0, games: 1 },
+  );
+
+  const aliceAgain = await getStats('/api/player-stats/p1');
+  assert.equal(aliceAgain.body.games, 6);
 });
 
 test('reuses lifetime stats when the same player rejoins with a new id', async () => {
@@ -507,6 +557,124 @@ test('ended-game lobby return is idempotent for host after players are preserved
   const validateGuest = await fetch(`${baseUrl}/api/player/p2`);
   assert.equal(validateHost.status, 200);
   assert.equal(validateGuest.status, 200);
+});
+
+test('rejects removal or replacement of committed board tiles', async () => {
+  const committedState = makeState({ started: true, revision: 30 });
+  committedState.board[7][7] = { letter: 'A', blank: false };
+  await storage.saveGameState(committedState);
+
+  const removedState = structuredClone(committedState);
+  removedState.board[7][7] = null;
+  const removed = await postJson('/api/game/update', removedState);
+
+  assert.equal(removed.status, 400);
+  assert.match(String(removed.body.error || ''), /committed board tiles/i);
+
+  const replacedState = structuredClone(committedState);
+  replacedState.board[7][7] = { letter: 'B', blank: false };
+  const replaced = await postJson('/api/game/update', replacedState);
+
+  assert.equal(replaced.status, 400);
+  assert.match(String(replaced.body.error || ''), /committed board tiles/i);
+
+  const persisted = await storage.getGameState();
+  assert.deepEqual(persisted?.board[7][7], { letter: 'A', blank: false });
+});
+
+test('rejects a timeout skip that carries unsubmitted board tiles', async () => {
+  const activeState = makeState({ started: true, revision: 31 });
+  await storage.saveGameState(activeState);
+
+  const hybridSkip = structuredClone(activeState);
+  hybridSkip.board[7][7] = { letter: 'A', blank: false };
+  hybridSkip.currentPlayer = 'p2';
+  hybridSkip.turn = 2;
+  hybridSkip.moves = [{
+    playerId: 'p1',
+    playerName: 'Alice',
+    words: [],
+    score: 0,
+    turn: 2,
+    timestamp: Date.now(),
+    type: 'skip',
+    meta: null,
+  }];
+
+  const response = await postJson('/api/game/update', hybridSkip);
+
+  assert.equal(response.status, 400);
+  assert.match(String(response.body.error || ''), /cannot place board tiles/i);
+  const persisted = await storage.getGameState();
+  assert.equal(persisted?.board[7][7], null);
+  assert.equal(persisted?.currentPlayer, 'p1');
+  assert.equal(persisted?.moves.length, 0);
+});
+
+test('rejects a late skip from the player whose play already advanced the turn', async () => {
+  const acceptedPlay = makeState({ started: true, revision: 32 });
+  acceptedPlay.board[7][7] = { letter: 'A', blank: false };
+  acceptedPlay.currentPlayer = 'p2';
+  acceptedPlay.turn = 2;
+  acceptedPlay.moves = [{
+    playerId: 'p1',
+    playerName: 'Alice',
+    words: ['A'],
+    score: 1,
+    turn: 2,
+    timestamp: Date.now() - 1,
+    type: 'play',
+    meta: { placedTiles: [{ row: 7, col: 7, letter: 'A' }] },
+  }];
+  await storage.saveGameState(acceptedPlay);
+
+  const lateSkip = structuredClone(acceptedPlay);
+  lateSkip.turn = 3;
+  lateSkip.moves.push({
+    playerId: 'p1',
+    playerName: 'Alice',
+    words: [],
+    score: 0,
+    turn: 3,
+    timestamp: Date.now(),
+    type: 'skip',
+    meta: null,
+  });
+
+  const response = await postJson('/api/game/update', lateSkip);
+
+  assert.equal(response.status, 409);
+  assert.match(String(response.body.error || ''), /no longer owns/i);
+  const persisted = await storage.getGameState();
+  assert.equal(persisted?.moves.length, 1);
+  assert.equal(persisted?.currentPlayer, 'p2');
+  assert.deepEqual(persisted?.board[7][7], { letter: 'A', blank: false });
+});
+
+test('accepts a normal skip with an unchanged board and current move actor', async () => {
+  const activeState = makeState({ started: true, revision: 33 });
+  await storage.saveGameState(activeState);
+
+  const validSkip = structuredClone(activeState);
+  validSkip.currentPlayer = 'p2';
+  validSkip.turn = 2;
+  validSkip.moves = [{
+    playerId: 'p1',
+    playerName: 'Alice',
+    words: [],
+    score: 0,
+    turn: 2,
+    timestamp: Date.now(),
+    type: 'skip',
+    meta: null,
+  }];
+
+  const response = await postJson('/api/game/update', validSkip);
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.gameState.currentPlayer, 'p2');
+  assert.equal(response.body.gameState.moves.at(-1)?.type, 'skip');
+  assert.equal(response.body.gameState.board[7][7], null);
 });
 
 test('serves local word list without CommonJS __dirname', async () => {

@@ -70,7 +70,7 @@ export default function Tile({ letter, isSelected, isEmpty, isBlank, onClick, cl
     <div
       ref={rootRef}
       onClick={onClick}
-      draggable={!!onDragStart}
+      draggable={draggable ?? !!onDragStart}
       onDragStart={onDragStart}
       onDragEnd={onDragEnd}
       className={
