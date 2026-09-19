@@ -392,7 +392,11 @@ export default function Lobby() {
         return;
       }
 
-      const resp = await fetch('/api/game/start', { method: 'POST' });
+      const resp = await fetch('/api/game/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requesterId: storedId }),
+      });
       if (resp.ok) {
         const data = await resp.json();
         if (data && data.gameState) queryClient.setQueryData(['/api/game'], data.gameState);
@@ -1003,8 +1007,8 @@ export default function Lobby() {
   );
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-4">
-      <div className="w-full max-w-2xl bg-card p-6 rounded shadow-lg">
+    <div className="min-h-[100svh] flex items-start justify-center p-3 sm:p-4">
+      <div className="w-full max-w-2xl bg-card p-4 sm:p-6 rounded shadow-lg">
         <h2 className="text-2xl font-bold mb-4">Лобби — Ожидание игроков</h2>
         <div className="mb-4 flex items-center justify-between rounded border px-3 py-2 text-sm">
           <div className="text-muted-foreground">Сессия</div>
@@ -1233,7 +1237,7 @@ export default function Lobby() {
         </div>
         <div className="mb-4 text-sm text-muted-foreground">Игроки в лобби:</div>
         <div className="mb-3 text-xs text-muted-foreground">Готовность: {readyCount}/{gameState?.players?.length || 0}</div>
-        <div className="flex flex-col gap-2 max-h-60 overflow-auto">
+        <div className="flex flex-col gap-2">
           {(gameState?.players || []).map((p: any) => {
             const local = getStats(p.id);
             const isLocal = p.id === localStorage.getItem('playerId');
@@ -1260,7 +1264,7 @@ export default function Lobby() {
           {canResetSession && (
             <Button variant="destructive" onClick={handleResetSession}>Сбросить сессию</Button>
           )}
-          {!gameInProgress && !gameEnded && isHost && (
+          {!gameInProgress && !gameEnded && activeSessionPlayer && (
             <Button variant="secondary" onClick={handleStart} disabled={isStarting || !allReady}>{isStarting ? 'Запуск...' : 'Начать игру'}</Button>
           )}
         </div>

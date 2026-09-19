@@ -4,8 +4,9 @@ import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import { createServer, type Server } from "http";
 import { WebSocketServer, WebSocket } from 'ws';
 import { storage, type StoredPlayerStats, type StoredPlayerStatsEntry } from "./storage";
-import { BOARD_SIZE, TILE_DISTRIBUTION, MOVE_TIME, type GameState, type Player, gameStateSchema } from "@shared/schema";
+import { BOARD_SIZE, MAX_PLAYERS, TILE_DISTRIBUTION, MOVE_TIME, type GameState, type Player, gameStateSchema } from "@shared/schema";
 import { extractWordsFromBoard, calculateScoreBreakdown, checkGameEnd } from "./gameLogic";
+import { exchangeTiles } from '@shared/tileExchange';
 import { loadWordDictionary, isWordValid } from "./wordDictionary";
 import os from 'os';
 import fs from 'fs';
@@ -897,8 +898,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // Create new player
-      if (gameState.players.length >= 3) {
-        return res.status(400).json({ error: "Game is full (max 3 players)" });
+      if (gameState.players.length >= MAX_PLAYERS) {
+        return res.status(400).json({ error: `Game is full (max ${MAX_PLAYERS} players)` });
       }
 
       const playerId = `player_${Date.now()}_${Math.random()}`;
@@ -1220,6 +1221,40 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       if (previous && newMoves > prevMoves && incoming.moves) {
         const lastMove = incoming.moves[incoming.moves.length - 1];
+        if (lastMove.type === 'exchange') {
+          const previousPlayer = previous.players.find(player => player.id === lastMove.playerId)!;
+          let indices = lastMove.meta?.rackIndices;
+          // Older clients only supplied discarded letters; match each physical tile once.
+          if (!Array.isArray(indices) && Array.isArray(lastMove.meta?.discarded)) {
+            const remainingRack = [...previousPlayer.rack];
+            indices = lastMove.meta.discarded.map((letter: unknown) => {
+              const index = typeof letter === 'string' ? remainingRack.indexOf(letter) : -1;
+              if (index >= 0) remainingRack[index] = null;
+              return index;
+            });
+          }
+          if (!Array.isArray(indices)) {
+            return res.status(400).json({ error: 'Exchange requires selected rack tiles.' });
+          }
+          try {
+            const exchanged = exchangeTiles(previousPlayer.rack, previous.tileBag, indices);
+            incoming.tileBag = exchanged.tileBag;
+            for (let i = incoming.tileBag.length - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              [incoming.tileBag[i], incoming.tileBag[j]] = [incoming.tileBag[j], incoming.tileBag[i]];
+            }
+            for (const player of incoming.players) {
+              const savedPlayer = previous.players.find(saved => saved.id === player.id)!;
+              player.rack = player.id === lastMove.playerId ? exchanged.rack : [...savedPlayer.rack];
+              player.score = savedPlayer.score;
+            }
+            lastMove.words = [];
+            lastMove.score = 0;
+            lastMove.meta = { rackIndices: indices, discarded: exchanged.discarded };
+          } catch (error) {
+            return res.status(400).json({ error: error instanceof Error ? error.message : 'Invalid exchange' });
+          }
+        }
         // Only validate scoring for 'play' moves
         if (lastMove.type !== 'skip' && lastMove.type !== 'exchange') {
           // Prefer placedTiles provided by the client in move.meta. Fallback to board diff.
@@ -1757,6 +1792,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const { state } = await loadActiveStateWithExpiry();
       if (!state) return res.status(400).json({ error: 'No game to start' });
       if (!Array.isArray(state.players) || state.players.length === 0) return res.status(400).json({ error: 'No players to start game' });
+      const requesterId = String(req.body?.requesterId || '').trim();
+      if (!requesterId) return res.status(401).json({ error: 'requesterId is required' });
+      if (!state.players.some(player => player.id === requesterId)) {
+        return res.status(403).json({ error: 'Only lobby participants can start a game' });
+      }
       if (gameInProgress(state)) return res.status(409).json({ error: 'Game already started' });
 
       // Enforce readiness: all players in lobby must be marked ready.

@@ -4,6 +4,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Users } from "lucide-react";
+import { MAX_PLAYERS } from "@shared/schema";
 
 interface JoinGameDialogProps {
   open: boolean;
@@ -68,7 +69,7 @@ export default function JoinGameDialog({ open, playerCount, onJoin, defaultName,
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <Users className="w-4 h-4" />
             <span data-testid="text-player-count">
-              {playerCount}/3 игроков
+              {playerCount}/{MAX_PLAYERS} игроков
             </span>
           </div>
           {error && (
@@ -78,7 +79,7 @@ export default function JoinGameDialog({ open, playerCount, onJoin, defaultName,
             type="submit" 
             className="w-full" 
             size="lg"
-            disabled={!playerName.trim() || !password.trim() || playerCount >= 3 || isLoading}
+            disabled={!playerName.trim() || !password.trim() || playerCount >= MAX_PLAYERS || isLoading}
             data-testid="button-join"
           >
             {isLoading ? 'Подключение...' : 'Присоединиться'}

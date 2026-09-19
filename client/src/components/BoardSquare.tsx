@@ -96,7 +96,8 @@ function BoardTile({
             try { e.dataTransfer.setDragImage(ghost, offsetX, offsetY); } catch (err) {}
             setTimeout(() => ghost.remove(), 0);
           } catch (err) {
-            // ignore
+            e.preventDefault();
+            document.body.classList.remove('dragging');
           }
         } : undefined}
         onDragEnd={canDrag ? () => { document.body.classList.remove('dragging'); } : undefined}

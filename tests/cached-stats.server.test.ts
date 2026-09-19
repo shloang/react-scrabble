@@ -4,6 +4,7 @@ import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Express } from 'express';
 import type { GameState, Player } from '@shared/schema';
+import { TILE_DISTRIBUTION } from '@shared/schema';
 
 type RegisterRoutesFn = (app: Express) => Promise<Server>;
 type StorageLike = {
@@ -328,6 +329,26 @@ test('participant can remove stale players from a non-active lobby', async () =>
     removed.body.gameState.players.map((p: Player) => p.id),
     ['host', 'ready'],
   );
+});
+
+test('allows four lobby players and rejects a fifth', async () => {
+  await storage.saveGameState(makeState({
+    revision: 24,
+    players: [
+      makePlayer('p1', 'Alice', 0),
+      makePlayer('p2', 'Bob', 0),
+      makePlayer('p3', 'Carol', 0),
+    ],
+  }));
+
+  const fourth = await postJson('/api/game/join', { playerName: 'Dana', password: 'secret' });
+  assert.equal(fourth.status, 200);
+  assert.equal(fourth.body.gameState.players.length, 4);
+  assert.equal(fourth.body.gameState.players.at(-1)?.name, 'Dana');
+
+  const fifth = await postJson('/api/game/join', { playerName: 'Eve', password: 'secret' });
+  assert.equal(fifth.status, 400);
+  assert.match(String(fifth.body.error || ''), /max 4 players/i);
 });
 
 test('outsiders and active games cannot remove lobby players', async () => {
@@ -675,6 +696,99 @@ test('accepts a normal skip with an unchanged board and current move actor', asy
   assert.equal(response.body.gameState.currentPlayer, 'p2');
   assert.equal(response.body.gameState.moves.at(-1)?.type, 'skip');
   assert.equal(response.body.gameState.board[7][7], null);
+});
+
+test('a non-host participant can start when all four players are ready', async () => {
+  const state = makeState({ players: ['p1', 'p2', 'p3', 'p4'].map(id => ({ ...makePlayer(id, id, 0), ready: true })) });
+  await storage.saveGameState(state);
+  const started = await postJson('/api/game/start', { requesterId: 'p4' });
+  assert.equal(started.status, 200);
+  assert.equal(started.body.gameState.turn, 1);
+  assert.equal(started.body.gameState.players.length, 4);
+  assert.ok(started.body.gameState.players.every((player: Player) => player.rack.filter(Boolean).length === 7));
+  const again = await postJson('/api/game/start', { requesterId: 'p2' });
+  assert.equal(again.status, 409);
+});
+
+test('start rejects an unready lobby and non-participants without changing the session', async () => {
+  const state = makeState();
+  state.players[1].ready = true;
+  await storage.saveGameState(state);
+  assert.equal((await postJson('/api/game/start', {})).status, 401);
+  assert.equal((await postJson('/api/game/start', { requesterId: 'outsider' })).status, 403);
+  const unready = await postJson('/api/game/start', { requesterId: 'p2' });
+  assert.equal(unready.status, 400);
+  assert.deepEqual(unready.body.notReadyPlayers, ['Alice']);
+  assert.deepEqual(await storage.getGameState(), state);
+});
+
+function makeExchangeState(bagCount = 6) {
+  const state = makeState({ started: true });
+  const tiles = Object.entries(TILE_DISTRIBUTION).flatMap(([letter, count]) => Array<string>(count).fill(letter));
+  for (const player of state.players) player.rack = tiles.splice(0, 7);
+  state.tileBag = tiles.splice(0, bagCount);
+  tiles.forEach((letter, index) => { state.board[Math.floor(index / 15)][index % 15] = { letter }; });
+  return state;
+}
+
+function makeExchangeUpdate(state: GameState, indices: number[]) {
+  const next = structuredClone(state);
+  next.currentPlayer = next.players[1].id;
+  next.turn += 1;
+  next.moves = [{ playerId: state.currentPlayer!, playerName: 'Alice', type: 'exchange', words: [], score: 0,
+    turn: next.turn, timestamp: Date.now(), meta: { rackIndices: indices } }];
+  return next;
+}
+
+test('rejects seven-for-six exchanges, including old clients, without losing rack tiles', async () => {
+  const state = makeExchangeState();
+  await storage.saveGameState(state);
+  const update = makeExchangeUpdate(state, [0, 1, 2, 3, 4, 5, 6]);
+  update.players[0].rack[6] = null;
+  const rejected = await postJson('/api/game/update', update);
+  assert.equal(rejected.status, 400);
+  assert.match(rejected.body.error, /only 6 remain/);
+  assert.deepEqual(await storage.getGameState(), state);
+
+  update.moves![0].meta = { discarded: state.players[0].rack };
+  assert.equal((await postJson('/api/game/update', update)).status, 400);
+  assert.deepEqual(await storage.getGameState(), state);
+});
+
+test('exchanges exactly six from a six-tile bag using saved rack and bag data', async () => {
+  const state = makeExchangeState();
+  state.previews = { p1: [{ row: 14, col: 14, letter: 'A' }], p2: [{ row: 14, col: 13, letter: 'B' }] };
+  await storage.saveGameState(state);
+  const update = makeExchangeUpdate(state, [0, 1, 2, 3, 4, 5]);
+  update.players[0].rack = Array(7).fill('FAKE');
+  update.players[1].rack = Array(7).fill('FAKE');
+  update.tileBag = [];
+  const response = await postJson('/api/game/update', update);
+  assert.equal(response.status, 200);
+  const saved = response.body.gameState as GameState;
+  assert.deepEqual(saved.players[0].rack, [...state.tileBag, state.players[0].rack[6]]);
+  assert.deepEqual(saved.players[1].rack, state.players[1].rack);
+  assert.deepEqual([...saved.tileBag].sort(), state.players[0].rack.slice(0, 6).sort());
+  assert.equal(saved.players[0].score, state.players[0].score);
+  assert.deepEqual(saved.board, state.board);
+  assert.equal(saved.turn, 2);
+  assert.equal(saved.previews?.p1, undefined);
+  assert.deepEqual(saved.previews?.p2, state.previews.p2);
+  assert.equal((await postJson('/api/game/update', update)).status, 409);
+});
+
+test('exchange rejects duplicate slots, empty slots and an empty bag', async () => {
+  const state = makeExchangeState();
+  await storage.saveGameState(state);
+  for (const indices of [[], [0, 0], [-1], [7], [1.5]]) {
+    assert.equal((await postJson('/api/game/update', makeExchangeUpdate(state, indices))).status, 400);
+    assert.deepEqual(await storage.getGameState(), state);
+  }
+  state.players[0].rack[0] = null;
+  assert.equal((await postJson('/api/game/update', makeExchangeUpdate(state, [0]))).status, 400);
+  const emptyBagState = makeExchangeState(0);
+  await storage.saveGameState(emptyBagState);
+  assert.equal((await postJson('/api/game/update', makeExchangeUpdate(emptyBagState, [1]))).status, 400);
 });
 
 test('serves local word list without CommonJS __dirname', async () => {

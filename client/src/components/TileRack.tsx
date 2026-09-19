@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Tile from "./Tile";
 import { Button } from "@/components/ui/button";
 import { Shuffle, RotateCcw } from "lucide-react";
@@ -13,6 +13,7 @@ interface TileRackProps {
   canInteract: boolean;
   canShuffle?: boolean;
   isPaused?: boolean;
+  turn?: number;
   onReorder?: (from: number, to: number) => void;
   onDropFromBoard?: (fromRow: number, fromCol: number, toIndex: number) => void;
 }
@@ -27,12 +28,39 @@ function TileRack({
   canInteract,
   canShuffle = canInteract,
   isPaused = false,
+  turn,
   onReorder,
   onDropFromBoard
 }: TileRackProps) {
   const [dragPreview, setDragPreview] = useState<{ fromIndex: number; overIndex: number } | null>(null);
+  const dragPreviewRef = useRef<typeof dragPreview>(null);
+  const dragFrameRef = useRef<number | null>(null);
+  const dragImageRef = useRef<HTMLElement | null>(null);
+  const dragImageTimerRef = useRef<number | null>(null);
+  const cleanupTimerRef = useRef<number | null>(null);
   const slotRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const previousRectsRef = useRef<Record<string, DOMRect>>({});
+  const canDrag = canInteract && !isPaused && selectedIndices === undefined;
+
+  const resetDragPreview = useCallback(() => {
+    if (cleanupTimerRef.current !== null) window.clearTimeout(cleanupTimerRef.current);
+    cleanupTimerRef.current = null;
+    if (dragFrameRef.current !== null) window.cancelAnimationFrame(dragFrameRef.current);
+    if (dragImageTimerRef.current !== null) window.clearTimeout(dragImageTimerRef.current);
+    dragFrameRef.current = null;
+    dragImageTimerRef.current = null;
+    dragPreviewRef.current = null;
+    dragImageRef.current?.remove();
+    dragImageRef.current = null;
+    setDragPreview(null);
+    document.body.classList.remove('dragging');
+    document.querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target', 'invalid'));
+    document.querySelectorAll('.drag-ghost').forEach(el => el.remove());
+  }, []);
+
+  useEffect(() => {
+    resetDragPreview();
+  }, [rack, canDrag, turn, resetDragPreview]);
 
   const visualSlots = useMemo(() => {
     const base = rack.map((letter, index) => ({
@@ -59,6 +87,11 @@ function TileRack({
   useLayoutEffect(() => {
     const nextRects: Record<string, DOMRect> = {};
 
+    // Measure layout positions, not positions displaced by an unfinished animation.
+    for (const el of Object.values(slotRefs.current)) {
+      el?.getAnimations?.().forEach(animation => animation.cancel());
+    }
+
     for (const slot of visualSlots) {
       const el = slotRefs.current[slot.id];
       if (!el) continue;
@@ -73,8 +106,7 @@ function TileRack({
       const dy = previousRect.top - nextRect.top;
       if (Math.abs(dx) < 1 && Math.abs(dy) < 1) continue;
 
-      el.getAnimations?.().forEach((animation) => animation.cancel());
-      el.animate(
+      el.animate?.(
         [
           { transform: `translate(${dx}px, ${dy}px)` },
           { transform: 'translate(0, 0)' },
@@ -90,40 +122,48 @@ function TileRack({
   }, [visualSlots]);
 
   useEffect(() => {
-    const cleanupDragState = () => {
-      setDragPreview(null);
-      document.body.classList.remove('dragging');
-      document.querySelectorAll('.drop-target').forEach((el) => {
-        el.classList.remove('drop-target', 'invalid');
-      });
-    };
     const scheduleCleanup = () => {
-      window.setTimeout(cleanupDragState, 0);
+      if (cleanupTimerRef.current !== null) window.clearTimeout(cleanupTimerRef.current);
+      cleanupTimerRef.current = window.setTimeout(resetDragPreview, 0);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') resetDragPreview();
+    };
+    const handleVisibilityChange = () => {
+      if (document.hidden) resetDragPreview();
+    };
+    const recoverMissedRelease = (event: PointerEvent) => {
+      if (event.buttons === 0 && document.body.classList.contains('dragging')) resetDragPreview();
     };
 
-    window.addEventListener('dragend', cleanupDragState);
-    window.addEventListener('drop', scheduleCleanup);
-    window.addEventListener('mouseup', scheduleCleanup);
-    window.addEventListener('blur', cleanupDragState);
+    window.addEventListener('dragend', resetDragPreview, true);
+    window.addEventListener('drop', scheduleCleanup, true);
+    window.addEventListener('mouseup', scheduleCleanup, true);
+    window.addEventListener('pointerup', scheduleCleanup, true);
+    window.addEventListener('pointermove', recoverMissedRelease, true);
+    window.addEventListener('keydown', handleKeyDown, true);
+    window.addEventListener('blur', resetDragPreview);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
-      window.removeEventListener('dragend', cleanupDragState);
-      window.removeEventListener('drop', scheduleCleanup);
-      window.removeEventListener('mouseup', scheduleCleanup);
-      window.removeEventListener('blur', cleanupDragState);
+      window.removeEventListener('dragend', resetDragPreview, true);
+      window.removeEventListener('drop', scheduleCleanup, true);
+      window.removeEventListener('mouseup', scheduleCleanup, true);
+      window.removeEventListener('pointerup', scheduleCleanup, true);
+      window.removeEventListener('pointermove', recoverMissedRelease, true);
+      window.removeEventListener('keydown', handleKeyDown, true);
+      window.removeEventListener('blur', resetDragPreview);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      resetDragPreview();
     };
-  }, []);
-
-  const resetDragPreview = () => {
-    setDragPreview(null);
-    document.body.classList.remove('dragging');
-  };
+  }, [resetDragPreview]);
 
   const updateDragOverIndex = (index: number) => {
-    setDragPreview(prev => {
-      if (!prev || prev.overIndex === index) return prev;
-      return { ...prev, overIndex: index };
-    });
+    const previous = dragPreviewRef.current;
+    if (!previous || previous.overIndex === index) return;
+    const next = { ...previous, overIndex: index };
+    dragPreviewRef.current = next;
+    setDragPreview(next);
   };
 
   const createLiftDragImage = (e: any) => {
@@ -141,6 +181,7 @@ function TileRack({
     ghost.style.pointerEvents = 'none';
     ghost.style.zIndex = '9999';
     document.body.appendChild(ghost);
+    dragImageRef.current = ghost;
 
     try {
       e.dataTransfer.setDragImage(ghost, rect.width / 2, rect.height / 2);
@@ -148,7 +189,11 @@ function TileRack({
       // ignore if the browser rejects custom drag images
     }
 
-    window.setTimeout(() => ghost.remove(), 80);
+    dragImageTimerRef.current = window.setTimeout(() => {
+      ghost.remove();
+      dragImageRef.current = null;
+      dragImageTimerRef.current = null;
+    }, 80);
   };
 
   return (
@@ -156,23 +201,26 @@ function TileRack({
       <div
         className={`grid grid-cols-7 gap-2 mb-4 rounded-md transition-colors ${isPaused ? 'bg-black [&>*]:invisible' : ''}`}
         aria-disabled={isPaused}
+        onDragOver={(e) => {
+          if (!canDrag) return;
+          e.preventDefault();
+          const rect = e.currentTarget.getBoundingClientRect();
+          const index = Math.floor((e.clientX - rect.left) / (rect.width / rack.length));
+          updateDragOverIndex(Math.max(0, Math.min(rack.length - 1, index)));
+        }}
       >
-        {visualSlots.map((slot) => (
+        {[...visualSlots].sort((a, b) => a.originalIndex - b.originalIndex).map((slot) => (
           <div
             key={slot.id}
             ref={(el) => {
               slotRefs.current[slot.id] = el;
             }}
             className="aspect-square"
-            onDragOver={(e) => {
-              e.preventDefault();
-            }}
+            style={{ order: visualSlots.findIndex(item => item.id === slot.id) }}
             onDragEnter={(e) => {
+              if (!canDrag) return;
               const el = e.currentTarget as HTMLElement;
               if (el) el.classList.add('drop-target');
-              if (dragPreview) {
-                updateDragOverIndex(slot.isDragged ? dragPreview.overIndex : slot.originalIndex);
-              }
             }}
             onDragLeave={(e) => {
               const el = e.currentTarget as HTMLElement;
@@ -180,6 +228,10 @@ function TileRack({
             }}
             onDrop={(e) => {
               e.preventDefault();
+              if (!canDrag) {
+                resetDragPreview();
+                return;
+              }
               const el = e.currentTarget as HTMLElement;
               if (el) el.classList.remove('drop-target');
               try {
@@ -188,8 +240,9 @@ function TileRack({
                 const parsed = JSON.parse(d);
 
                 if (parsed?.source === 'rack' && typeof parsed.index === 'number') {
+                  if (!dragPreviewRef.current) return;
                   const from = parsed.index as number;
-                  const to = dragPreview?.overIndex ?? slot.originalIndex;
+                  const to = dragPreviewRef.current.overIndex;
                   if (from !== to && typeof onReorder === 'function') {
                     onReorder(from, to);
                   }
@@ -217,17 +270,26 @@ function TileRack({
                   (selectedIndices && selectedIndices.includes(slot.originalIndex)) || selectedTileIndex === slot.originalIndex
                 }
                 onClick={() => canInteract && slot.letter && onTileClick(slot.originalIndex)}
+                draggable={canDrag && !!slot.letter}
                 onDragStart={(e) => {
-                  if (!canInteract || !slot.letter) return;
+                  if (!canDrag || !slot.letter) {
+                    e.preventDefault();
+                    return;
+                  }
+                  resetDragPreview();
                   try {
-                    e.dataTransfer.setData('text/plain', JSON.stringify({ source: 'rack', index: slot.originalIndex }));
+                    e.dataTransfer.setData('text/plain', JSON.stringify({ source: 'rack', index: slot.originalIndex, letter: slot.letter, turn }));
                     e.dataTransfer.effectAllowed = 'move';
                     document.body.classList.add('dragging');
                     createLiftDragImage(e);
-                    window.requestAnimationFrame(() => {
-                      setDragPreview({ fromIndex: slot.originalIndex, overIndex: slot.originalIndex });
+                    const preview = { fromIndex: slot.originalIndex, overIndex: slot.originalIndex };
+                    dragPreviewRef.current = preview;
+                    dragFrameRef.current = window.requestAnimationFrame(() => {
+                      dragFrameRef.current = null;
+                      setDragPreview(dragPreviewRef.current);
                     });
                   } catch (err) {
+                    e.preventDefault();
                     resetDragPreview();
                   }
                 }}
@@ -292,6 +354,7 @@ export default memo(TileRack, (prev, next) => (
   prev.canInteract === next.canInteract &&
   prev.canShuffle === next.canShuffle &&
   prev.isPaused === next.isPaused &&
+  prev.turn === next.turn &&
   prev.onTileClick === next.onTileClick &&
   prev.onShuffle === next.onShuffle &&
   prev.onRecall === next.onRecall &&

@@ -16,9 +16,12 @@ interface TileProps {
 }
 
 export default function Tile({ letter, isSelected, isEmpty, isBlank, onClick, className = '', draggable, onDragStart, onDragEnd, style }: TileProps) {
+  const { ref: rootRef, size } = useElementSize<HTMLDivElement>();
+
   if (isEmpty) {
     return (
       <div 
+        ref={rootRef}
         className={`w-full aspect-square border-2 border-dashed border-muted rounded-md ${className}`}
         data-testid="tile-empty"
       />
@@ -28,6 +31,7 @@ export default function Tile({ letter, isSelected, isEmpty, isBlank, onClick, cl
   if (!letter) {
     return (
       <div 
+        ref={rootRef}
         className={`w-full aspect-square bg-muted/30 rounded-md ${className}`}
         data-testid="tile-null"
       />
@@ -36,7 +40,6 @@ export default function Tile({ letter, isSelected, isEmpty, isBlank, onClick, cl
 
   const points = isBlank ? 0 : (TILE_VALUES[letter] ?? 0);
 
-  const { ref: rootRef, size } = useElementSize<HTMLDivElement>();
   const tileSize = Math.min(size.width, size.height);
 
   const explicitFontSize = (() => {

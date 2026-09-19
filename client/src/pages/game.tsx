@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { MOVE_TIME, Player, PlacedTile, GameState, TILE_VALUES } from '@shared/schema';
+import { exchangeTiles } from '@shared/tileExchange';
 import { getGameState, joinGame as joinGameApi, updateGameState, validateWord, sendPreview, initializeGame, resetSession as resetSessionApi } from '@/lib/gameApi';
 import { ensureWordListLoaded, isWordLocal } from '@/lib/wordLocal';
 import { extractWordsFromBoard, calculateScore, validatePlacement } from '@/lib/gameLogic';
@@ -71,7 +72,7 @@ export default function Game() {
   const [, setLocation] = useLocation();
   const statsUpdatedRef = useRef<boolean>(false);
   const lastTurnStartRef = useRef<number | null>(null);
-  const turnActionInFlightRef = useRef<'submit' | 'skip' | null>(null);
+  const turnActionInFlightRef = useRef<'submit' | 'skip' | 'exchange' | null>(null);
   const timerExpiryPendingRef = useRef(false);
 
   // Sync dark mode state to document and localStorage
@@ -160,6 +161,7 @@ export default function Game() {
   // Poll for game state
   const { data: gameState, refetch } = useQuery<GameState | null>({
     queryKey: ['/api/game'],
+    queryFn: getGameState,
     refetchInterval: (query) => {
       const latestGameState = query.state.data as GameState | null | undefined;
       if (latestGameState?.gameEnded) return false;
@@ -240,7 +242,7 @@ export default function Game() {
     },
     onError: async (error: any) => {
       const message = String(error?.message || '');
-      if (message.toLowerCase().includes('stale')) {
+      if (message.toLowerCase().includes('stale') || message.toLowerCase().includes('timed out')) {
         try { await refetch(); } catch {}
         toast({
           variant: "destructive",
@@ -716,13 +718,6 @@ export default function Game() {
     return () => window.removeEventListener('keydown', onKey);
   }, [gameState?.gameEnded, showEndScreenMinimized]);
 
-  const shuffleArray = (array: string[]) => {
-    for (let i = array.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [array[i], array[j]] = [array[j], array[i]];
-    }
-  };
-
   const handleJoinGame = (name: string, password: string) => {
     setJoinError(null);
     joinMutation.mutate({ name, password });
@@ -960,16 +955,18 @@ export default function Game() {
   }, [clientBoardState, clientRackState, gameState, getCurrentPlayer, isValidating, placedTiles, playSound, selectedTileIndex, toServerRackIndex, typingCursor]);
 
   const handleTileClick = useCallback((index: number) => {
+    if (isValidating || gameState?.paused || gameState?.gameEnded) return;
     if (discardMode) {
       setSelectedDiscardIndices(prev => {
         if (prev.includes(index)) return prev.filter(i => i !== index);
+        if (prev.length >= (gameState?.tileBag.length ?? 0)) return prev;
         return [...prev, index];
       });
       return;
     }
 
     setSelectedTileIndex(selectedTileIndex === index ? null : index);
-  }, [discardMode, selectedTileIndex]);
+  }, [discardMode, selectedTileIndex, isValidating, gameState?.paused, gameState?.gameEnded, gameState?.tileBag.length]);
 
   // Reorder rack indices (drag within rack) - client-side only, no server update
   const handleReorderRack = useCallback(async (from: number, to: number) => {
@@ -1043,6 +1040,7 @@ export default function Game() {
 
   const handleBoardTileDrop = useCallback(async (row: number, col: number, data: any) => {
     if (!gameState || gameState.gameEnded || gameState.paused || isValidating) return;
+    if (data?.turn !== undefined && data.turn !== gameState.turn) return;
 
     const currentPlayer = getCurrentPlayer();
     if (!currentPlayer) return;
@@ -1053,9 +1051,10 @@ export default function Game() {
     try {
       if (data?.source === 'rack') {
         const displayIndex = data.index as number;
+        if (!Number.isInteger(displayIndex)) return;
         const index = toServerRackIndex(displayIndex);
         const letter = rackToCheck[index];
-        if (!letter) return;
+        if (!letter || (data.letter !== undefined && data.letter !== letter)) return;
 
         const targetLetter = boardToCheck[row][col];
 
@@ -1462,6 +1461,8 @@ export default function Game() {
   };
 
   const handleStartDiscard = () => {
+    if (!gameState || gameState.currentPlayer !== playerId || gameState.paused || gameState.gameEnded || isValidating || gameState.tileBag.length === 0) return;
+    handleRecall();
     setDiscardMode(true);
     setSelectedDiscardIndices([]);
     setSelectedTileIndex(null);
@@ -1473,93 +1474,62 @@ export default function Game() {
   };
 
   const handleConfirmDiscard = async () => {
-    // If tiles were placed this turn, recall them first so the exchange acts on rack tiles
-    if (placedTiles.length > 0) {
-      await handleRecall();
-      // refetch to ensure we operate on fresh state
-      const refreshed = await refetch();
-      if (!refreshed.data) return;
-    }
-
-    if (!gameState || gameState.currentPlayer !== playerId) return;
-    if (gameState.paused) {
-      toast({ variant: 'destructive', title: 'Игра приостановлена', description: 'Нельзя обменивать плитки во время паузы' });
-      return;
-    }
+    if (!gameState || gameState.currentPlayer !== playerId || gameState.paused || gameState.gameEnded) return;
+    if (turnActionInFlightRef.current || selectedDiscardIndices.length === 0) return;
     const pid = playerId;
     if (!pid) return;
-    const currentPlayer = getCurrentPlayer();
-    if (!currentPlayer) return;
-    if (selectedDiscardIndices.length === 0) return;
-
-    // Work on the latest state snapshot
-    const fresh = await getGameState();
-    const newState = structuredClone(fresh || gameState);
-    const newPlayer = Array.isArray(newState.players) ? newState.players.find(p => p.id === playerId) : undefined;
-    if (!newPlayer) return;
-
-    // Collect discarded letters and empty the selected slots
-    const discarded: string[] = [];
-    // sort indices so assignment is deterministic
-    const indices = Array.from(new Set(selectedDiscardIndices.map(toServerRackIndex))).sort((a, b) => a - b);
-    for (const idx of indices) {
-      const letter = newPlayer.rack[idx];
-      if (letter !== null) {
-        discarded.push(letter);
-        newPlayer.rack[idx] = null;
-      }
-    }
-
-    // Draw replacements first (so discarded tiles are not immediately drawn back)
-    for (const idx of indices) {
-      if (newState.tileBag.length > 0) {
-        newPlayer.rack[idx] = newState.tileBag.shift() || null;
-      } else {
-        newPlayer.rack[idx] = null;
-      }
-    }
-
-    // Now return discarded tiles to the bag and shuffle for future draws
-    if (discarded.length > 0) {
-      newState.tileBag.push(...discarded);
-      shuffleArray(newState.tileBag);
-    }
-
-    // Advance turn
-    const currentIndex = Array.isArray(newState.players) ? newState.players.findIndex(p => p.id === playerId) : -1;
-    const playersLen = Array.isArray(newState.players) ? newState.players.length : 0;
-    if (playersLen === 0) {
-      newState.currentPlayer = null;
-    } else {
-      const nextIndex = (currentIndex + 1) % playersLen;
-      newState.currentPlayer = (Array.isArray(newState.players) ? newState.players[nextIndex] : undefined)?.id ?? null;
-      newState.turn += 1;
-    }
-
+    const indices = selectedDiscardIndices.map(toServerRackIndex);
+    const selectedRack = getCurrentPlayer()?.rack;
+    turnActionInFlightRef.current = 'exchange';
+    setIsValidating(true);
+    let exchangeAccepted = false;
     try {
-      // Append exchange entry to history
+      const fresh = await getGameState();
+      if (!fresh || fresh.currentPlayer !== pid || fresh.turn !== gameState.turn || fresh.paused || fresh.gameEnded) {
+        await refetch();
+        return;
+      }
+      const newState = structuredClone(fresh);
+      const newPlayer = newState.players.find(player => player.id === pid);
+      if (!newPlayer) return;
+      if (indices.some(index => newPlayer.rack[index] !== selectedRack?.[index])) {
+        throw new Error('Фишки изменились. Выберите их для обмена заново.');
+      }
+      const exchanged = exchangeTiles(newPlayer.rack, newState.tileBag, indices);
+      newPlayer.rack = exchanged.rack;
+      newState.tileBag = exchanged.tileBag;
+      const currentIndex = newState.players.findIndex(player => player.id === pid);
+      newState.currentPlayer = newState.players[(currentIndex + 1) % newState.players.length].id;
+      newState.turn += 1;
       newState.moves = newState.moves || [];
-      const exchPlayer = Array.isArray(newState.players) ? newState.players.find(p => p.id === playerId) : undefined;
       newState.moves.push({
         playerId: pid,
-        playerName: exchPlayer?.name || '',
+        playerName: newPlayer.name,
         words: [],
         score: 0,
         turn: newState.turn,
         timestamp: Date.now(),
         type: 'exchange',
-        meta: { discarded }
+        meta: { rackIndices: indices, discarded: exchanged.discarded }
       });
 
       await updateMutation.mutateAsync(newState);
+      exchangeAccepted = true;
       setDiscardMode(false);
       setSelectedDiscardIndices([]);
       setSelectedTileIndex(null);
       setPlacedTiles([]);
       setTypedSequence([]);
     } catch (err) {
-      // keep discard mode open on error
       console.error('[Discard] failed', err);
+      toast({ variant: 'destructive', title: 'Не удалось обменять фишки', description: err instanceof Error ? err.message : 'Попробуйте снова' });
+    } finally {
+      setIsValidating(false);
+      if (turnActionInFlightRef.current === 'exchange') turnActionInFlightRef.current = null;
+      if (timerExpiryPendingRef.current) {
+        timerExpiryPendingRef.current = false;
+        if (!exchangeAccepted) void handleSkipTurn();
+      }
     }
   };
 
@@ -1653,6 +1623,14 @@ export default function Game() {
   const stableHandleRecall = useEventCallback(handleRecall);
   const stableHandleReorderRack = useEventCallback(handleReorderRack);
   const stableHandleDropFromBoard = useEventCallback(handleDropFromBoard);
+  const playerCount = gameState?.players.length || 0;
+  const playerGridClass = playerCount >= 4
+    ? 'grid-cols-2 sm:grid-cols-4 lg:grid-cols-2'
+    : playerCount === 3
+      ? 'grid-cols-3'
+      : playerCount === 2
+        ? 'grid-cols-2'
+        : 'grid-cols-1';
 
   return (
     <div className="min-h-[100svh] bg-background">
@@ -1709,7 +1687,7 @@ export default function Game() {
           <div className="min-h-[100svh] lg:h-[100dvh] flex flex-col lg:flex-row gap-4 p-4 overflow-x-hidden lg:overflow-hidden">
           <aside className="lg:w-72 lg:flex-none flex flex-col gap-3 min-w-0 lg:min-h-0 lg:h-full">
             <h1 className="text-2xl font-bold">Игроки</h1>
-            <div className="flex flex-row gap-2 overflow-x-auto shrink-0">
+            <div className={`grid shrink-0 gap-2 ${playerGridClass}`}>
               {(gameState?.players || []).map((player, index) => (
                 <PlayerCard
                   key={player.id}
@@ -1916,8 +1894,9 @@ export default function Game() {
                     onDropFromBoard={stableHandleDropFromBoard}
                     // Disable interactions when the game has ended
                     canInteract={canEditLocalPlacement}
-                    canShuffle={!isJoining && !gameState?.gameEnded && !gameState?.paused}
+                    canShuffle={canEditLocalPlacement}
                     isPaused={!!gameState?.paused}
+                    turn={gameState?.turn}
                   />
                 </div>
                   <div className="flex flex-col gap-2">
@@ -1948,7 +1927,7 @@ export default function Game() {
                           variant="outline"
                           size="lg"
                           onClick={handleStartDiscard}
-                          disabled={isValidating || !!gameState?.gameEnded || (gameState && gameState.tileBag.length === 0)}
+                          disabled={!isCurrentPlayer || !canEditLocalPlacement || !gameState?.tileBag.length}
                           className="w-full"
                           data-testid="button-swap"
                           title={gameState && gameState.tileBag.length === 0 ? 'Нельзя обменивать фишки: мешок пуст' : ''}
@@ -1958,12 +1937,12 @@ export default function Game() {
                       </>
                     ) : (
                       <>
-                        <div className="text-sm text-muted-foreground">Выберите фишки для обмена</div>
+                        <div className="text-sm text-muted-foreground">Обмен: {selectedDiscardIndices.length} / {Math.min(getCurrentPlayer()?.rack.filter(Boolean).length ?? 0, gameState?.tileBag.length ?? 0)}</div>
                         <div className="flex gap-2">
                             <Button
                               size="lg"
                               onClick={handleConfirmDiscard}
-                              disabled={selectedDiscardIndices.length === 0 || isValidating || !!gameState?.gameEnded}
+                              disabled={selectedDiscardIndices.length === 0 || selectedDiscardIndices.length > (gameState?.tileBag.length ?? 0) || !isCurrentPlayer || !canEditLocalPlacement}
                               className="flex-1"
                               data-testid="button-confirm-swap"
                             >

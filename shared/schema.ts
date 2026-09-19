@@ -4,6 +4,7 @@ import { z } from "zod";
 
 export const BOARD_SIZE = 15;
 export const MOVE_TIME = 180; // 3 minutes per turn
+export const MAX_PLAYERS = 4;
 
 export const TILE_VALUES: Record<string, number> = {
   А: 1, Б: 3, В: 2, Г: 3, Д: 2, Е: 1, Ж: 5, З: 5, И: 1, Й: 4, К: 2, Л: 2,

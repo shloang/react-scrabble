@@ -21,13 +21,13 @@ interface PlayerCardProps {
 function PlayerCard({ player, isCurrentPlayer, playerIndex, voiceMuted, voiceVolume, voiceLevel, voiceStatus, onToggleMute, onVolumeChange }: PlayerCardProps) {
   return (
     <Card
-      className={`p-3 border-l-4 border-border transition-all duration-150 ${isCurrentPlayer ? 'ring-1 ring-primary shadow' : 'shadow-sm'} w-1/3 min-h-28 overflow-hidden card-scale`}
+      className={`w-full min-w-0 overflow-hidden border-l-4 border-border p-2 transition-all duration-150 ${isCurrentPlayer ? 'ring-1 ring-primary shadow' : 'shadow-sm'} card-scale`}
       data-testid={`player-card-${player.id}`}
     >
-      <div className="flex flex-col gap-2">
+      <div className="flex flex-col gap-1.5">
         {/* Top row: avatar alone */}
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-full bg-muted overflow-hidden flex items-center justify-center shrink-0">
+        <div className="flex items-center gap-2">
+          <div className="w-8 h-8 rounded-full bg-muted overflow-hidden flex items-center justify-center shrink-0">
             <img
               src={`https://robohash.org/${encodeURIComponent(player.name)}?size=80x80`}
               alt={`${player.name} avatar`}
@@ -44,7 +44,7 @@ function PlayerCard({ player, isCurrentPlayer, playerIndex, voiceMuted, voiceVol
         {/* Second row: score and current marker */}
         <div className="flex items-center justify-between">
           {/* <div className="text-sm text-muted-foreground">{isCurrentPlayer ? 'ход' : ''}</div> */}
-          <div className="text-lg font-semibold" data-testid={`player-score-${player.id}`}>{player.score}</div>
+          <div className="text-base font-semibold leading-none" data-testid={`player-score-${player.id}`}>{player.score}</div>
         </div>
 
         {/* Third row: voice controls */}
